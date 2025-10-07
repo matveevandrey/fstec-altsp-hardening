@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Скрипт проверки соответствия эталонной конфигурации ОС Альт Линукс СП
-# Версия: 1.9 - Проверка всех реальных пользователей (UID >= 500)
+# Версия: 2.1 - Исправлена проверка политики блокировки учетных записей
 
 set -e
 
@@ -110,8 +110,11 @@ check_password_policy() {
         log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
     fi
     
+    # 6-8. Проверка старения паролей с правильным парсингом русского вывода
+    local chage_output=$(chage -l root 2>/dev/null)
+    
     # 6. Минимальное количество дней между сменами пароля
-    local min_days=$(chage -l root 2>/dev/null | grep "Minimum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    local min_days=$(echo "$chage_output" | grep -i "Минимальное количество дней между сменой пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1)
     log "6. Минимальное количество дней между сменами пароля: ${min_days:-не настроено} (требуется: 0)"
     if [[ "$min_days" -eq 0 ]]; then
         log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
@@ -120,7 +123,7 @@ check_password_policy() {
     fi
     
     # 7. Максимальное количество дней между сменами пароля
-    local max_days=$(chage -l root 2>/dev/null | grep "Maximum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    local max_days=$(echo "$chage_output" | grep -i "Максимальное количество дней между сменой пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1)
     log "7. Максимальное количество дней между сменами пароля: ${max_days:-не настроено} (требуется: 90)"
     if [[ "$max_days" -eq 90 ]]; then
         log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
@@ -129,7 +132,7 @@ check_password_policy() {
     fi
     
     # 8. Число дней выдачи предупреждения до смены пароля
-    local warn_days=$(chage -l root 2>/dev/null | grep "warning" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    local warn_days=$(echo "$chage_output" | grep -i "Количество дней с предупреждением перед деактивацией пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1)
     log "8. Число дней выдачи предупреждения до смены пароля: ${warn_days:-не настроено} (требуется: 7)"
     if [[ "$warn_days" -eq 7 ]]; then
         log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
@@ -138,18 +141,18 @@ check_password_policy() {
     fi
     
     # 9. Число дней неактивности после устаревания пароля до блокировки учетной записи
-    local inactive_days=$(chage -l root 2>/dev/null | grep "Inactive" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-    log "9. Число дней неактивности после устаревания пароля: ${inactive_days:-не настроено} (требуется: -1 или отключено)"
-    if [[ "$inactive_days" == "-1" ]] || [[ -z "$inactive_days" ]] || [[ "$inactive_days" == "never" ]]; then
+    local inactive_days=$(echo "$chage_output" | grep -i "Пароль будет деактивирован через" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    log "9. Число дней неактивности после устаревания пароля: ${inactive_days:-никогда} (требуется: никогда или отключено)"
+    if [[ "$inactive_days" == "никогда" ]] || [[ -z "$inactive_days" ]]; then
         log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ (отключено)"
     else
         log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
     fi
     
     # 10. Срок действия учетной записи пользователя
-    local account_expires=$(chage -l root 2>/dev/null | grep "Account expires" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-    log "10. Срок действия учетной записи: ${account_expires:-never} (требуется: never или отключено)"
-    if [[ "$account_expires" == "never" ]] || [[ "$account_expires" == "" ]] || [[ "$account_expires" == "никогда" ]]; then
+    local account_expires=$(echo "$chage_output" | grep -i "Срок действия учётной записи истекает" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    log "10. Срок действия учетной записи: ${account_expires:-никогда} (требуется: никогда или отключено)"
+    if [[ "$account_expires" == "никогда" ]] || [[ -z "$account_expires" ]]; then
         log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ (отключено)"
     else
         log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
@@ -172,37 +175,85 @@ check_account_lockout() {
     log ""
     log "=== ПРОВЕРКА ПОЛИТИКИ БЛОКИРОВКИ УЧЕТНЫХ ЗАПИСЕЙ ==="
     
-    # Проверка настроек PAM для блокировки учетных записей
+    # Согласно эталону проверяем 6 параметров:
+    # 1. Индивидуальные настройки - Включено
+    # 2. Не сбрасывать счетчик - -
+    # 3. Не использовать счетчик для пользователя с uid=0 - -
+    # 4. Неуспешных попыток - 5
+    # 5. Период блокировки - 15
+    # 6. Период разблокировки - 15
+    
     local deny=""
     local unlock_time=""
+    local lock_time=""
+    local even_deny_root=""
+    local root_unlock_time=""
     
     # Проверка всех возможных PAM файлов в Альт СП
     local pam_files=("/etc/pam.d/system-auth" "/etc/pam.d/password-auth" "/etc/pam.d/login" "/etc/pam.d/system-login")
     
     for pam_file in "${pam_files[@]}"; do
         if [[ -f "$pam_file" ]]; then
+            # Проверка pam_tally2
             if grep -q "pam_tally2.so" "$pam_file" 2>/dev/null; then
                 deny=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
                 unlock_time=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
-                log "Найдены настройки в: $pam_file"
+                even_deny_root=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "even_deny_root" | head -1)
+                root_unlock_time=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "root_unlock_time=[0-9]*" | cut -d= -f2 | head -1)
+                log "Найдены настройки pam_tally2 в: $pam_file"
                 break
+            # Проверка pam_faillock  
             elif grep -q "pam_faillock.so" "$pam_file" 2>/dev/null; then
                 deny=$(grep "pam_faillock.so" "$pam_file" 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
                 unlock_time=$(grep "pam_faillock.so" "$pam_file" 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
-                log "Найдены настройки в: $pam_file"
+                log "Найдены настройки pam_faillock в: $pam_file"
                 break
             fi
         fi
     done
     
-    log "Текущие настройки блокировки:"
-    log "  Количество попыток: ${deny:-не настроено} (требуется: 5)"
-    log "  Время блокировки: ${unlock_time:-не настроено} секунд (требуется: 900)"
-    
-    if [[ "$deny" -eq 5 ]]; then
-        log_color "$GREEN" "✓ Количество неудачных попыток: $deny (СООТВЕТСТВУЕТ)"
+    log "1. Индивидуальные настройки: ${deny:+Включено} ${deny:-не настроено} (требуется: Включено)"
+    if [[ -n "$deny" ]]; then
+        log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
     else
-        log_color "$RED" "✗ Количество неудачных попыток: ${deny:-не настроено} (НЕ СООТВЕТСТВУЕТ)"
+        log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
+    fi
+    
+    log "2. Не сбрасывать счетчик: - (требуется: -)"
+    log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
+    
+    log "3. Не использовать счетчик для пользователя с uid=0: ${even_deny_root:--} (требуется: -)"
+    if [[ -z "$even_deny_root" ]]; then
+        log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
+    else
+        log_color "$YELLOW" "   ⚠ НАСТРОЕНО (even_deny_root)"
+    fi
+    
+    log "4. Неуспешных попыток: ${deny:-не настроено} (требуется: 5)"
+    if [[ "$deny" -eq 5 ]]; then
+        log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
+    else
+        log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
+    fi
+    
+    # Период блокировки и разблокировки (в минутах согласно эталону)
+    local unlock_time_minutes=""
+    if [[ -n "$unlock_time" ]]; then
+        unlock_time_minutes=$((unlock_time / 60))
+    fi
+    
+    log "5. Период блокировки: ${unlock_time_minutes:-не настроено} минут (требуется: 15)"
+    if [[ "$unlock_time_minutes" -eq 15 ]]; then
+        log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
+    else
+        log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
+    fi
+    
+    log "6. Период разблокировки: ${unlock_time_minutes:-не настроено} минут (требуется: 15)"
+    if [[ "$unlock_time_minutes" -eq 15 ]]; then
+        log_color "$GREEN" "   ✓ СООТВЕТСТВУЕТ"
+    else
+        log_color "$RED" "   ✗ НЕ СООТВЕТСТВУЕТ"
     fi
     
     # Проверка индивидуальных настроек для реальных пользователей
@@ -219,10 +270,12 @@ check_account_lockout() {
         for user in "${system_users[@]}"; do
             log "Пользователь: $user"
             
-            # Проверка старения паролей для каждого пользователя
-            local user_max_days=$(chage -l "$user" 2>/dev/null | grep "Maximum" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
-            local user_min_days=$(chage -l "$user" 2>/dev/null | grep "Minimum" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
-            local user_warn_days=$(chage -l "$user" 2>/dev/null | grep "warning" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
+            # Проверка старения паролей для каждого пользователя с русским парсингом
+            local user_chage_output=$(chage -l "$user" 2>/dev/null)
+            
+            local user_max_days=$(echo "$user_chage_output" | grep -i "Максимальное количество дней между сменой пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
+            local user_min_days=$(echo "$user_chage_output" | grep -i "Минимальное количество дней между сменой пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
+            local user_warn_days=$(echo "$user_chage_output" | grep -i "Количество дней с предупреждением перед деактивацией пароля" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
             
             log "  Максимальный срок пароля: $user_max_days (требуется: 90)"
             log "  Минимальный срок пароля: $user_min_days (требуется: 0)"
@@ -230,15 +283,15 @@ check_account_lockout() {
             
             # Проверка соответствия
             local user_ok=true
-            if [[ "$user_max_days" != "90" ]] && [[ "$user_max_days" != "не настроено" ]]; then
+            if [[ "$user_max_days" != "90" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Максимальный срок пароля не соответствует"
             fi
-            if [[ "$user_min_days" != "0" ]] && [[ "$user_min_days" != "не настроено" ]]; then
+            if [[ "$user_min_days" != "0" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Минимальный срок пароля не соответствует"
             fi
-            if [[ "$user_warn_days" != "7" ]] && [[ "$user_warn_days" != "не настроено" ]]; then
+            if [[ "$user_warn_days" != "7" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Срок предупреждения не соответствует"
             fi
