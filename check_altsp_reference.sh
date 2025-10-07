@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Скрипт проверки соответствия эталонной конфигурации ОС Альт Линукс СП
-# Версия: 1.8 - Только проверка параметров из эталона + проверка реальных пользователей
+# Версия: 1.9 - Проверка всех реальных пользователей (UID >= 500)
 
 set -e
 
@@ -27,17 +27,13 @@ log_color() {
 
 # Функция для определения реальных пользователей системы
 get_system_users() {
-    # Пользователи с UID >= 1000 (обычные пользователи) и не системные
     local users=()
     while IFS=: read -r user _ uid _ _ home shell; do
-        # Пропускаем системных пользователей (UID < 1000), кроме root
-        if [[ $uid -ge 1000 ]] || [[ "$user" == "root" ]]; then
-            # Пропускаем пользователей с /sbin/nologin и /bin/false
-            if [[ "$shell" != */nologin ]] && [[ "$shell" != */false ]]; then
-                # Пропускаем пользователей без домашней директории или с нестандартными директориями
-                if [[ -d "$home" ]] && [[ "$home" == /home/* || "$home" == /root ]]; then
-                    users+=("$user")
-                fi
+        # Включаем root и пользователей с UID >= 500 (традиционные пользователи)
+        if [[ $uid -eq 0 ]] || [[ $uid -ge 500 ]]; then
+            # Пропускаем системных пользователей с неинтерактивными shell
+            if [[ "$shell" != */nologin ]] && [[ "$shell" != */false ]] && [[ "$shell" != "/dev/null" ]]; then
+                users+=("$user")
             fi
         fi
     done < /etc/passwd
@@ -224,25 +220,25 @@ check_account_lockout() {
             log "Пользователь: $user"
             
             # Проверка старения паролей для каждого пользователя
-            local user_max_days=$(chage -l "$user" 2>/dev/null | grep "Maximum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-            local user_min_days=$(chage -l "$user" 2>/dev/null | grep "Minimum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-            local user_warn_days=$(chage -l "$user" 2>/dev/null | grep "warning" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+            local user_max_days=$(chage -l "$user" 2>/dev/null | grep "Maximum" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
+            local user_min_days=$(chage -l "$user" 2>/dev/null | grep "Minimum" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
+            local user_warn_days=$(chage -l "$user" 2>/dev/null | grep "warning" | awk -F: '{print $2}' | tr -d ' ' | head -1 || echo "не настроено")
             
-            log "  Максимальный срок пароля: ${user_max_days:-не настроено} (требуется: 90)"
-            log "  Минимальный срок пароля: ${user_min_days:-не настроено} (требуется: 0)"
-            log "  Предупреждение за: ${user_warn_days:-не настроено} дней (требуется: 7)"
+            log "  Максимальный срок пароля: $user_max_days (требуется: 90)"
+            log "  Минимальный срок пароля: $user_min_days (требуется: 0)"
+            log "  Предупреждение за: $user_warn_days дней (требуется: 7)"
             
             # Проверка соответствия
             local user_ok=true
-            if [[ "$user_max_days" -ne 90 ]]; then
+            if [[ "$user_max_days" != "90" ]] && [[ "$user_max_days" != "не настроено" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Максимальный срок пароля не соответствует"
             fi
-            if [[ "$user_min_days" -ne 0 ]]; then
+            if [[ "$user_min_days" != "0" ]] && [[ "$user_min_days" != "не настроено" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Минимальный срок пароля не соответствует"
             fi
-            if [[ "$user_warn_days" -ne 7 ]]; then
+            if [[ "$user_warn_days" != "7" ]] && [[ "$user_warn_days" != "не настроено" ]]; then
                 user_ok=false
                 log_color "$RED" "  ✗ Срок предупреждения не соответствует"
             fi
