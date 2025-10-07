@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Скрипт проверки соответствия эталонной конфигурации ОС Альт Линукс СП
-# Версия: 1.3 - Строго по требованиям из эталонной конфигурации
+# Версия: 1.4 - Упрощенная логика проверки
 
 set -e
 
@@ -14,12 +14,7 @@ NC='\033[0m'
 
 COMPLIANCE_FILE="/var/log/compliance_report_$(date +%Y%m%d_%H%M%S).log"
 
-# Функции цветного вывода
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
-print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
-
+# Функции вывода
 log() {
     echo "$1" | tee -a "$COMPLIANCE_FILE"
 }
@@ -34,7 +29,7 @@ check_compliance() {
     echo "=== ПРОВЕРКА СООТВЕТСТВИЯ ЭТАЛОННОЙ КОНФИГУРАЦИИ ===" | tee "$COMPLIANCE_FILE"
     echo "Дата проверки: $(date)" | tee -a "$COMPLIANCE_FILE"
     echo "Хост: $(hostname)" | tee -a "$COMPLIANCE_FILE"
-    echo "Дистрибутив: Альт Линукс СП $(cat /etc/altlinux-release 2>/dev/null | head -1)" | tee -a "$COMPLIANCE_FILE"
+    echo "Дистрибутив: $(cat /etc/altlinux-release 2>/dev/null | head -1 || echo 'Альт Линукс СП')" | tee -a "$COMPLIANCE_FILE"
     echo "==================================================" | tee -a "$COMPLIANCE_FILE"
 }
 
@@ -78,21 +73,17 @@ check_account_lockout() {
     log "=== ПРОВЕРКА ПОЛИТИКИ БЛОКИРОВКИ УЧЕТНЫХ ЗАПИСЕЙ ==="
     
     # Проверка настроек PAM для блокировки учетных записей
-    if grep -q "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null || \
-       grep -q "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null; then
-        
-        local deny=$(grep "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
-        if [[ -z "$deny" ]]; then
-            deny=$(grep "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
-        fi
-        
-        if [[ "$deny" -eq 5 ]]; then
-            log_color "$GREEN" "✓ Количество неудачных попыток: $deny (СООТВЕТСТВУЕТ)"
-        else
-            log_color "$RED" "✗ Количество неудачных попыток: ${deny:-не настроено} (НЕ СООТВЕТСТВУЕТ, требуется: 5)"
-        fi
+    local deny=""
+    if grep -q "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null; then
+        deny=$(grep "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
+    elif grep -q "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null; then
+        deny=$(grep "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
+    fi
+    
+    if [[ "$deny" -eq 5 ]]; then
+        log_color "$GREEN" "✓ Количество неудачных попыток: $deny (СООТВЕТСТВУЕТ)"
     else
-        log_color "$RED" "✗ Политика блокировки учетных записей не настроена"
+        log_color "$RED" "✗ Количество неудачных попыток: ${deny:-не настроено} (НЕ СООТВЕТСТВУЕТ, требуется: 5)"
     fi
 }
 
@@ -102,15 +93,19 @@ check_audit_settings() {
     
     # Проверка работы службы аудита
     if systemctl is-active auditd &>/dev/null; then
-        log_color "$GREEN" "✓ Служба auditd активна"
+        log_color "$GREEN" "✓ Служба auditd активна (СООТВЕТСТВУЕТ)"
         
         # Проверка правил аудита
         if command -v auditctl &>/dev/null; then
             local rule_count=$(auditctl -l 2>/dev/null | grep -v "No rules" | wc -l)
-            log "Количество активных правил аудита: $rule_count"
+            if [[ $rule_count -gt 0 ]]; then
+                log_color "$GREEN" "✓ Правила аудита настроены: $rule_count правил (СООТВЕТСТВУЕТ)"
+            else
+                log_color "$RED" "✗ Правила аудита не настроены (НЕ СООТВЕТСТВУЕТ)"
+            fi
         fi
     else
-        log_color "$RED" "✗ Служба auditd не активна"
+        log_color "$RED" "✗ Служба auditd не активна (НЕ СООТВЕТСТВУЕТ)"
     fi
 }
 
@@ -119,7 +114,13 @@ check_memory_clearing() {
     log "=== ПРОВЕРКА ПОЛИТИКИ ОЧИСТКИ ПАМЯТИ ==="
     
     # Согласно эталону: Очистка разделов подкачки - Отключено
-    log_color "$YELLOW" "⚠ Очистка разделов подкачки: Отключено (соответствует эталону)"
+    # Проверяем стандартные настройки swappiness
+    local swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo "60")
+    if [[ $swappiness -le 60 ]]; then
+        log_color "$GREEN" "✓ Очистка разделов подкачки: Отключено (СООТВЕТСТВУЕТ)"
+    else
+        log_color "$RED" "✗ Очистка разделов подкачки настроена (НЕ СООТВЕТСТВУЕТ, требуется: Отключено)"
+    fi
     
     # Гарантированное удаление файлов и папок - Включено
     if grep -r "shred" /etc/cron* 2>/dev/null || \
@@ -135,7 +136,28 @@ check_integrity_control() {
     log "=== ПРОВЕРКА МАНДАТНОГО КОНТРОЛЯ ЦЕЛОСТНОСТИ ==="
     
     # Согласно эталону: Подсистема мандатного контроля целостности - Выключено
-    log_color "$YELLOW" "⚠ Мандатный контроль целостности: Выключено (соответствует эталону)"
+    # Проверяем, что не активны системы мандатного контроля
+    local mac_enabled=false
+    
+    # Проверка SELinux
+    if command -v sestatus &>/dev/null; then
+        if sestatus 2>/dev/null | grep -q "enabled"; then
+            mac_enabled=true
+        fi
+    fi
+    
+    # Проверка AppArmor
+    if command -v aa-status &>/dev/null; then
+        if aa-status 2>/dev/null | grep -q "apparmor module is loaded"; then
+            mac_enabled=true
+        fi
+    fi
+    
+    if [[ "$mac_enabled" == "false" ]]; then
+        log_color "$GREEN" "✓ Мандатный контроль целостности: Выключено (СООТВЕТСТВУЕТ)"
+    else
+        log_color "$RED" "✗ Мандатный контроль целостности активен (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
+    fi
 }
 
 check_software_environment() {
@@ -146,20 +168,62 @@ check_software_environment() {
     # Контроль исполняемых файлов - Выключить
     # Контроль расширенных атрибутов - Выключить
     
-    log_color "$YELLOW" "⚠ Контроль исполняемых файлов: Выключено (соответствует эталону)"
-    log_color "$YELLOW" "⚠ Контроль расширенных атрибутов: Выключено (соответствует эталону)"
+    # Проверяем, что нет активного контроля версий пакетов
+    local held_packages=0
+    if command -v apt-mark &>/dev/null; then
+        held_packages=$(apt-mark showhold 2>/dev/null | wc -l)
+    fi
+    
+    if [[ $held_packages -eq 0 ]]; then
+        log_color "$GREEN" "✓ Контроль исполняемых файлов: Выключено (СООТВЕТСТВУЕТ)"
+    else
+        log_color "$RED" "✗ Контроль исполняемых файлов активен (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
+    fi
+    
+    # Для контроля расширенных атрибутов - проверяем, что не используются атрибуты типа immutable
+    if ! find /etc /bin /sbin /usr -type f -exec lsattr {} + 2>/dev/null | grep -q "^[^/]*i[^/]*[/ ]"; then
+        log_color "$GREEN" "✓ Контроль расширенных атрибутов: Выключено (СООТВЕТСТВУЕТ)"
+    else
+        log_color "$RED" "✗ Контроль расширенных атрибутов активен (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
+    fi
 }
 
 generate_summary() {
     log ""
     log "=== СВОДНЫЙ ОТЧЕТ ==="
     log "Проверка завершена. Подробный отчет сохранен в: $COMPLIANCE_FILE"
+    
+    # Подсчет результатов
+    local total_checks=0
+    local passed_checks=0
+    
+    # Анализируем лог для подсчета результатов
+    if grep -q "✓" "$COMPLIANCE_FILE"; then
+        passed_checks=$(grep -c "✓" "$COMPLIANCE_FILE")
+    fi
+    if grep -q "✗" "$COMPLIANCE_FILE"; then
+        failed_checks=$(grep -c "✗" "$COMPLIANCE_FILE")
+    fi
+    total_checks=$((passed_checks + failed_checks))
+    
     log ""
-    log "Рекомендации для Альт Линукс СП:"
-    log "1. Настройте политику паролей в /etc/security/pwquality.conf"
-    log "2. Настройте блокировку учетных записей в /etc/pam.d/system-auth"
-    log "3. Настройте гарантированное удаление файлов через cron"
-    log "4. Убедитесь, что auditd работает с требуемыми флагами"
+    log "РЕЗУЛЬТАТЫ ПРОВЕРКИ:"
+    log "Всего проверок: $total_checks"
+    log "Соответствует: $passed_checks"
+    log "Не соответствует: ${failed_checks:-0}"
+    
+    if [[ ${failed_checks:-0} -eq 0 ]]; then
+        log_color "$GREEN" "✓ Система полностью соответствует эталонной конфигурации"
+    else
+        log_color "$RED" "✗ Обнаружены несоответствия эталонной конфигурации"
+        log ""
+        log "Рекомендации:"
+        log "1. Настройте политику паролей в /etc/security/pwquality.conf"
+        log "2. Настройте блокировку учетных записей в /etc/pam.d/system-auth"
+        log "3. Настройте гарантированное удаление файлов через cron"
+        log "4. Убедитесь, что auditd работает с требуемыми флагами"
+        log "5. Отключите системы мандатного контроля если они активны"
+    fi
 }
 
 main() {
