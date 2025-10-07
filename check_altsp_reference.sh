@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Скрипт проверки соответствия эталонной конфигурации ОС Альт Линукс СП
-# Версия: 1.6 - Полная проверка всех параметров политики паролей
+# Версия: 1.8 - Только проверка параметров из эталона + проверка реальных пользователей
 
 set -e
 
@@ -25,6 +25,25 @@ log_color() {
     echo -e "${color}$message${NC}" | tee -a "$COMPLIANCE_FILE"
 }
 
+# Функция для определения реальных пользователей системы
+get_system_users() {
+    # Пользователи с UID >= 1000 (обычные пользователи) и не системные
+    local users=()
+    while IFS=: read -r user _ uid _ _ home shell; do
+        # Пропускаем системных пользователей (UID < 1000), кроме root
+        if [[ $uid -ge 1000 ]] || [[ "$user" == "root" ]]; then
+            # Пропускаем пользователей с /sbin/nologin и /bin/false
+            if [[ "$shell" != */nologin ]] && [[ "$shell" != */false ]]; then
+                # Пропускаем пользователей без домашней директории или с нестандартными директориями
+                if [[ -d "$home" ]] && [[ "$home" == /home/* || "$home" == /root ]]; then
+                    users+=("$user")
+                fi
+            fi
+        fi
+    done < /etc/passwd
+    echo "${users[@]}"
+}
+
 check_compliance() {
     echo "=== ПРОВЕРКА СООТВЕТСТВИЯ ЭТАЛОННОЙ КОНФИГУРАЦИИ ===" | tee "$COMPLIANCE_FILE"
     echo "Дата проверки: $(date)" | tee -a "$COMPLIANCE_FILE"
@@ -36,6 +55,16 @@ check_compliance() {
 check_password_policy() {
     log ""
     log "=== ПРОВЕРКА ПОЛИТИКИ ПАРОЛЕЙ ==="
+    
+    # Проверка настроек в /etc/login.defs
+    log "Проверка /etc/login.defs:"
+    local login_defs_max=$(grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || echo "не настроено")
+    local login_defs_min=$(grep "^PASS_MIN_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || echo "не настроено") 
+    local login_defs_warn=$(grep "^PASS_WARN_AGE" /etc/login.defs 2>/dev/null | awk '{print $2}' || echo "не настроено")
+    
+    log "  PASS_MAX_DAYS: $login_defs_max"
+    log "  PASS_MIN_DAYS: $login_defs_min"
+    log "  PASS_WARN_AGE: $login_defs_warn"
     
     # 1. Минимальная длина пароля
     local minlen=$(grep -E "^\s*minlen\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
@@ -151,13 +180,24 @@ check_account_lockout() {
     local deny=""
     local unlock_time=""
     
-    if grep -q "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null; then
-        deny=$(grep "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
-        unlock_time=$(grep "pam_tally2.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
-    elif grep -q "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null; then
-        deny=$(grep "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
-        unlock_time=$(grep "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/login 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
-    fi
+    # Проверка всех возможных PAM файлов в Альт СП
+    local pam_files=("/etc/pam.d/system-auth" "/etc/pam.d/password-auth" "/etc/pam.d/login" "/etc/pam.d/system-login")
+    
+    for pam_file in "${pam_files[@]}"; do
+        if [[ -f "$pam_file" ]]; then
+            if grep -q "pam_tally2.so" "$pam_file" 2>/dev/null; then
+                deny=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
+                unlock_time=$(grep "pam_tally2.so" "$pam_file" 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
+                log "Найдены настройки в: $pam_file"
+                break
+            elif grep -q "pam_faillock.so" "$pam_file" 2>/dev/null; then
+                deny=$(grep "pam_faillock.so" "$pam_file" 2>/dev/null | grep -o "deny=[0-9]*" | cut -d= -f2 | head -1)
+                unlock_time=$(grep "pam_faillock.so" "$pam_file" 2>/dev/null | grep -o "unlock_time=[0-9]*" | cut -d= -f2 | head -1)
+                log "Найдены настройки в: $pam_file"
+                break
+            fi
+        fi
+    done
     
     log "Текущие настройки блокировки:"
     log "  Количество попыток: ${deny:-не настроено} (требуется: 5)"
@@ -169,12 +209,48 @@ check_account_lockout() {
         log_color "$RED" "✗ Количество неудачных попыток: ${deny:-не настроено} (НЕ СООТВЕТСТВУЕТ)"
     fi
     
-    # Вывод текущих счетчиков блокировок
+    # Проверка индивидуальных настроек для реальных пользователей
     log ""
-    log "Текущие счетчики блокировок:"
-    if command -v pam_tally2 &>/dev/null; then
-        pam_tally2 --user root 2>/dev/null | while read line; do
-            log "  $line"
+    log "=== ПРОВЕРКА ИНДИВИДУАЛЬНЫХ НАСТРОЕК ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ==="
+    
+    local system_users=($(get_system_users))
+    if [[ ${#system_users[@]} -eq 0 ]]; then
+        log "Реальные пользователи системы не найдены"
+    else
+        log "Найдены реальные пользователи: ${system_users[*]}"
+        log ""
+        
+        for user in "${system_users[@]}"; do
+            log "Пользователь: $user"
+            
+            # Проверка старения паролей для каждого пользователя
+            local user_max_days=$(chage -l "$user" 2>/dev/null | grep "Maximum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+            local user_min_days=$(chage -l "$user" 2>/dev/null | grep "Minimum" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+            local user_warn_days=$(chage -l "$user" 2>/dev/null | grep "warning" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+            
+            log "  Максимальный срок пароля: ${user_max_days:-не настроено} (требуется: 90)"
+            log "  Минимальный срок пароля: ${user_min_days:-не настроено} (требуется: 0)"
+            log "  Предупреждение за: ${user_warn_days:-не настроено} дней (требуется: 7)"
+            
+            # Проверка соответствия
+            local user_ok=true
+            if [[ "$user_max_days" -ne 90 ]]; then
+                user_ok=false
+                log_color "$RED" "  ✗ Максимальный срок пароля не соответствует"
+            fi
+            if [[ "$user_min_days" -ne 0 ]]; then
+                user_ok=false
+                log_color "$RED" "  ✗ Минимальный срок пароля не соответствует"
+            fi
+            if [[ "$user_warn_days" -ne 7 ]]; then
+                user_ok=false
+                log_color "$RED" "  ✗ Срок предупреждения не соответствует"
+            fi
+            
+            if [[ "$user_ok" == "true" ]]; then
+                log_color "$GREEN" "  ✓ Все настройки соответствуют"
+            fi
+            log ""
         done
     fi
 }
@@ -197,13 +273,6 @@ check_audit_settings() {
             
             if [[ $rule_count -gt 0 ]]; then
                 log_color "$GREEN" "✓ Правила аудита настроены: $rule_count правил (СООТВЕТСТВУЕТ)"
-                
-                # Вывод примеров правил
-                log ""
-                log "Примеры активных правил аудита:"
-                auditctl -l 2>/dev/null | head -5 | while read rule; do
-                    log "  $rule"
-                done
             else
                 log_color "$RED" "✗ Правила аудита не настроены (НЕ СООТВЕТСТВУЕТ)"
             fi
@@ -257,12 +326,12 @@ check_integrity_control() {
     
     # Проверка SELinux
     if command -v sestatus &>/dev/null; then
-        if sestatus 2>/dev/null | grep -q "enabled"; then
+        local selinux_status=$(sestatus 2>/dev/null | grep "SELinux status" | awk '{print $3}')
+        if [[ "$selinux_status" == "enabled" ]]; then
             mac_enabled=true
             mac_systems+=("SELinux")
         fi
-        local selinux_mode=$(sestatus 2>/dev/null | grep "Current mode" | awk '{print $3}' || echo "unknown")
-        log "SELinux статус: $selinux_mode"
+        log "SELinux статус: $selinux_status"
     fi
     
     # Проверка AppArmor
@@ -271,14 +340,13 @@ check_integrity_control() {
             mac_enabled=true
             mac_systems+=("AppArmor")
         fi
-        local apparmor_profiles=$(aa-status 2>/dev/null | grep "profiles are loaded" | awk '{print $1}' || echo "0")
-        log "AppArmor профилей загружено: $apparmor_profiles"
     fi
     
+    # Логика проверки согласно эталону (требуется Выключено)
     if [[ "$mac_enabled" == "false" ]]; then
-        log_color "$GREEN" "✓ Мандатный контроль целостности: Выключено (СООТВЕТСТВУЕТ)"
+        log_color "$GREEN" "✓ Мандатный контроль целостности: Выключено (СООТВЕТСТВУЕТ эталону)"
     else
-        log_color "$RED" "✗ Мандатный контроль целостности активен: ${mac_systems[*]} (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
+        log_color "$RED" "✗ Мандатный контроль целостности активен: ${mac_systems[*]} (НЕ СООТВЕТСТВУЕТ эталону, требуется: Выключено)"
     fi
 }
 
@@ -301,10 +369,6 @@ check_software_environment() {
         log_color "$GREEN" "✓ Контроль исполняемых файлов: Выключено (СООТВЕТСТВУЕТ)"
     else
         log_color "$RED" "✗ Контроль исполняемых файлов активен (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
-        log "Заблокированные пакеты:"
-        apt-mark showhold 2>/dev/null | head -5 | while read pkg; do
-            log "  $pkg"
-        done
     fi
     
     # Для контроля расширенных атрибутов - проверяем, что не используются атрибуты типа immutable
@@ -317,10 +381,6 @@ check_software_environment() {
         log_color "$GREEN" "✓ Контроль расширенных атрибутов: Выключено (СООТВЕТСТВУЕТ)"
     else
         log_color "$RED" "✗ Контроль расширенных атрибутов активен (НЕ СООТВЕТСТВУЕТ, требуется: Выключено)"
-        log "Файлы с атрибутом immutable:"
-        find /etc /bin /sbin /usr -type f -exec lsattr {} + 2>/dev/null | grep "^[^/]*i[^/]*[/ ]" | head -3 | while read file; do
-            log "  $file"
-        done
     fi
 }
 
@@ -353,25 +413,6 @@ generate_summary() {
         log_color "$GREEN" "✓ Система полностью соответствует эталонной конфигурации"
     else
         log_color "$RED" "✗ Обнаружены несоответствия эталонной конфигурации"
-        log ""
-        log "Рекомендации по исправлению:"
-        
-        # Контекстные рекомендации based on failed checks
-        if grep -q "Минимальная длина пароля.*НЕ СООТВЕТСТВУЕТ" "$COMPLIANCE_FILE"; then
-            log "1. Настройте минимальную длину пароля: echo 'minlen = 12' >> /etc/security/pwquality.conf"
-        fi
-        
-        if grep -q "Максимальное количество дней между сменами пароля.*НЕ СООТВЕТСТВУЕТ" "$COMPLIANCE_FILE"; then
-            log "2. Настройте старение паролей: chage -M 90 root"
-        fi
-        
-        if grep -q "Количество неудачных попыток.*НЕ СООТВЕТСТВУЕТ" "$COMPLIANCE_FILE"; then
-            log "3. Настройте блокировку учетных записей в /etc/pam.d/system-auth"
-        fi
-        
-        if grep -q "Гарантированное удаление файлов не настроено" "$COMPLIANCE_FILE"; then
-            log "4. Настройте гарантированное удаление файлов через cron"
-        fi
     fi
 }
 
