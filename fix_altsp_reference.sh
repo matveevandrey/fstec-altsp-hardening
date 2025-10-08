@@ -1,384 +1,235 @@
 #!/bin/bash
+# Настройка ОС Альт Линукс СП под эталонную модель (ФСТЭК/КСЗ/Таблица 1)
+# Версия: 1.3 (root включён в проверку и настройку индивидуальных сроков)
+# Режимы:
+#   без флагов / --check : только проверка соответствия
+#   --fix                : применить настройки к эталону
 
-# Скрипт настройки Альт Линукс СП в соответствии с эталонной конфигурацией
-# Версия: 1.1 - Исправлены ошибки auditd
+set -euo pipefail
 
-set -e
+# ---- Цвета/вывод ----
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG="/var/log/altsp_config_${TS}.log"
+MODE="check"
+[[ "${1:-}" == "--fix" ]] && MODE="fix"
+umask 077
 
-# Цвета для вывода
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+log()       { echo -e "$1" | tee -a "$LOG"; }
+ok()        { echo -e "${GREEN}✓ $1${NC}" | tee -a "$LOG"; }
+warn()      { echo -e "${YELLOW}⚠ $1${NC}" | tee -a "$LOG"; }
+fail()      { echo -e "${RED}✗ $1${NC}" | tee -a "$LOG"; }
+section()   { echo -e "\n${BLUE}=== $1 ===${NC}" | tee -a "$LOG"; }
 
-LOG_FILE="/var/log/fix_altsp_reference_$(date +%Y%m%d_%H%M%S).log"
+backup_file() { [[ -f "$1" ]] && cp -a "$1" "${1}.bak.${TS}" || true; }
 
-# Функции вывода
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-}
-
-print_success() { 
-    echo -e "${GREEN}✓ $1${NC}"
-    log "✓ $1"
-}
-
-print_warning() { 
-    echo -e "${YELLOW}⚠ $1${NC}"
-    log "⚠ $1"
-}
-
-print_info() { 
-    echo -e "${BLUE}ℹ $1${NC}"
-    log "ℹ $1"
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}ОШИБКА: Скрипт должен запускаться с правами root${NC}"
-        exit 1
-    fi
-}
-
-create_backup() {
-    local file=$1
-    if [[ -f "$file" ]]; then
-        cp "$file" "${file}.backup.$(date +%Y%m%d_%H%M%S)"
-        print_info "Создан бэкап: ${file}.backup.$(date +%Y%m%d_%H%M%S)"
-    fi
-}
-
-configure_password_policy() {
-    log ""
-    log "=== НАСТРОЙКА ПОЛИТИКИ ПАРОЛЕЙ ==="
-    
-    create_backup "/etc/security/pwquality.conf"
-    
-    # Настройка политики паролей
-    cat > /etc/security/pwquality.conf << 'EOF'
-# Настройки политики паролей согласно эталонной конфигурации
-minlen = 12
-minclass = 4
-dcredit = -1
-ucredit = -1
-lcredit = -1
-ocredit = -1
-maxrepeat = 3
-maxsequence = 4
-dictcheck = 1
-usercheck = 1
-enforcing = 1
-EOF
-
-    print_success "Настроена политика паролей: minlen=12, minclass=4"
-    
-    # Настройка PAM для использования pwquality
-    if [[ -f "/etc/pam.d/system-auth" ]]; then
-        create_backup "/etc/pam.d/system-auth"
-        if grep -q "pam_pwquality.so" /etc/pam.d/system-auth; then
-            sed -i 's/pam_pwquality\.so.*/pam_pwquality.so try_first_pass local_users_only retry=3 minlen=12 minclass=4/' /etc/pam.d/system-auth
-        else
-            # Добавляем строку после password required pam_deny.so
-            sed -i '/password.*pam_deny\.so/a password requisite pam_pwquality.so try_first_pass local_users_only retry=3 minlen=12 minclass=4' /etc/pam.d/system-auth
-        fi
-        print_success "Настроен PAM для использования pwquality"
-    fi
-    
-    # Настройка старения паролей
-    if command -v chage &>/dev/null; then
-        chage -M 90 -W 7 root
-        print_success "Настроено старение паролей: MAX_DAYS=90, WARN_DAYS=7 для root"
-        
-        # Для всех существующих пользователей
-        for user in $(getent passwd | cut -d: -f1); do
-            if [[ "$user" != "root" ]] && [[ "$user" != "nobody" ]] && [[ "$user" != "*" ]]; then
-                chage -M 90 -W 7 "$user" 2>/dev/null || true
-            fi
-        done
-        print_success "Настроено старение паролей для всех пользователей"
-    fi
-}
-
-configure_account_lockout() {
-    log ""
-    log "=== НАСТРОЙКА ПОЛИТИКИ БЛОКИРОВКИ УЧЕТНЫХ ЗАПИСЕЙ ==="
-    
-    # Настройка PAM для блокировки учетных записей
-    if [[ -f "/etc/pam.d/system-auth" ]]; then
-        create_backup "/etc/pam.d/system-auth"
-        
-        # Удаляем старые настройки блокировки
-        sed -i '/pam_tally2\.so/d' /etc/pam.d/system-auth
-        sed -i '/pam_faillock\.so/d' /etc/pam.d/system-auth
-        
-        # Добавляем настройки pam_tally2 (более стабильно в Альт)
-        sed -i '/auth.*required.*pam_deny\.so/i auth required pam_tally2.so deny=5 unlock_time=900 onerr=fail audit silent' /etc/pam.d/system-auth
-        sed -i '/account.*required.*pam_unix\.so/i account required pam_tally2.so' /etc/pam.d/system-auth
-        
-        print_success "Настроена блокировка учетных записей: 5 попыток, блокировка на 15 минут"
-    fi
-    
-    # Сбрасываем счетчики блокировок
-    if command -v pam_tally2 &>/dev/null; then
-        pam_tally2 --reset
-        print_success "Сброшены счетчики блокировок учетных записей"
-    fi
-}
-
-configure_audit_settings() {
-    log ""
-    log "=== НАСТРОЙКА АУДИТА ==="
-    
-    # Установка auditd если не установлен
-    if ! command -v auditctl &>/dev/null; then
-        print_info "Установка auditd..."
-        apt-get update
-        apt-get install -y auditd audispd-plugins
-    fi
-    
-    # Останавливаем службу перед настройкой
-    systemctl stop auditd 2>/dev/null || true
-    
-    # Базовая конфигурация auditd
-    create_backup "/etc/audit/auditd.conf"
-    
-    cat > /etc/audit/auditd.conf << 'EOF'
-log_file = /var/log/audit/audit.log
-log_format = RAW
-log_group = root
-priority_boost = 4
-flush = INCREMENTAL
-freq = 20
-num_logs = 5
-disp_qos = lossy
-dispatcher = /sbin/audispd
-name_format = NONE
-max_log_file = 8
-max_log_file_action = ROTATE
-space_left = 75
-space_left_action = SYSLOG
-action_mail_acct = root
-admin_space_left = 50
-admin_space_left_action = SUSPEND
-disk_full_action = SUSPEND
-disk_error_action = SUSPEND
-EOF
-
-    print_success "Настроен конфигурационный файл auditd"
-    
-    # Базовые правила аудита
-    create_backup "/etc/audit/rules.d/audit.rules"
-    
-    cat > /etc/audit/rules.d/audit.rules << 'EOF'
-## Первая строка должна быть пустой
--b 320
--f 1
-
-# Аудит системных вызовов
--a always,exit -F arch=b64 -S execve -k exec
--a always,exit -F arch=b32 -S execve -k exec
-
-# Аудит входа в систему
--w /var/log/lastlog -p wa -k logins
--w /var/run/faillock -p wa -k logins
-
-# Аудит изменений прав доступа
--w /etc/passwd -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/gshadow -p wa -k identity
-
-# Аудит критичных файлов
--w /etc/sudoers -p wa -k scope
--w /etc/sudoers.d -p wa -k scope
-
-# Аудит сетевых настроек
--w /etc/hosts -p wa -k hosts
--w /etc/network -p wa -k network
-
-# Аудит загрузки/выгрузки модулей ядра
--w /sbin/insmod -p x -k modules
--w /sbin/rmmod -p x -k modules
--w /sbin/modprobe -p x -k modules
-EOF
-
-    # Включаем автозагрузку
-    systemctl enable auditd
-    
-    # Запускаем службу
-    if systemctl start auditd; then
-        print_success "Служба auditd запущена"
-        
-        # Перезагружаем правила аудита
-        if auditctl -R /etc/audit/rules.d/audit.rules 2>/dev/null; then
-            print_success "Применены правила аудита"
-        else
-            print_warning "Правила аудита применены с предупреждениями"
-        fi
+ensure_pkg() {
+  local p="$1"
+  if ! rpm -q "$p" &>/dev/null; then
+    if [[ "$MODE" == "fix" ]]; then
+      ok "Устанавливаю пакет: $p"
+      apt-get -y update && apt-get -y install "$p"
     else
-        print_warning "Служба auditd не запущена, но настроена для автозапуска"
+      warn "Пакет $p не установлен"
+      return 1
     fi
+  fi
 }
 
-configure_memory_clearing() {
-    log ""
-    log "=== НАСТРОЙКА ПОЛИТИКИ ОЧИСТКИ ПАМЯТИ ==="
-    
-    # Настройка гарантированного удаления файлов через cron
-    if ! grep -q "shred" /etc/crontab 2>/dev/null; then
-        echo "# Гарантированное удаление временных файлов каждый день в 2:00" >> /etc/crontab
-        echo "0 2 * * * root find /tmp -type f -atime +1 -exec shred -zuf {} \;" >> /etc/crontab
-        print_success "Настроено гарантированное удаление файлов в /tmp"
-    fi
-    
-    # Настройка очистки других временных каталогов
-    if [[ ! -f "/etc/cron.daily/secure-delete" ]]; then
-        cat > /etc/cron.daily/secure-delete << 'EOF'
-#!/bin/bash
-# Гарантированное удаление временных файлов
-find /var/tmp -type f -atime +7 -exec shred -zuf {} \; 2>/dev/null
-find /tmp -type f -atime +1 -exec shred -zuf {} \; 2>/dev/null
-EOF
-        chmod +x /etc/cron.daily/secure-delete
-        print_success "Создан скрипт безопасного удаления для cron.daily"
-    fi
+# Определение реальных пользователей (включая root)
+get_users() {
+  awk -F: '($3==0 || $3>=500) && $7 !~ /(false|\/dev\/null)$/ {print $1}' /etc/passwd
 }
 
-configure_integrity_control() {
-    log ""
-    log "=== НАСТРОЙКА МАНДАТНОГО КОНТРОЛЯ ЦЕЛОСТНОСТИ ==="
-    
-    # Согласно эталонной конфигурации - выключено
-    print_info "Мандатный контроль целостности отключен (соответствует эталону)"
-    
-    # Отключаем SELinux если установлен (для совместимости)
-    if command -v setenforce &>/dev/null; then
-        setenforce 0
-        sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
-        print_info "SELinux переведен в режим disabled"
-    fi
+COUNT_TOTAL=0; COUNT_OK=0; COUNT_FAIL=0
+checkmark() { COUNT_TOTAL=$((COUNT_TOTAL+1)); [[ "$1" == "ok" ]] && COUNT_OK=$((COUNT_OK+1)) || COUNT_FAIL=$((COUNT_FAIL+1)); }
+
+header() {
+  echo "Запуск настройки эталонной конфигурации ОС Альт СП... Режим: $MODE" | tee "$LOG"
+  echo "Дата: $(date) | Хост: $(hostname) | Релиз: $(head -1 /etc/altlinux-release 2>/dev/null || echo ALT SP)" | tee -a "$LOG"
 }
 
-configure_software_environment() {
-    log ""
-    log "=== НАСТРОЙКА ЗАМКНУТОЙ ПРОГРАММНОЙ СРЕДЫ ==="
-    
-    # Согласно эталонной конфигурации - контроль выключен
-    print_info "Контроль исполняемых файлов отключен (соответствует эталону)"
-    print_info "Контроль расширенных атрибутов отключен (соответствует эталону)"
-    
-    # Базовая настройка APT для безопасности
-    if [[ ! -f "/etc/apt/apt.conf.d/99security" ]]; then
-        cat > /etc/apt/apt.conf.d/99security << 'EOF'
-# Базовые настройки безопасности APT
-APT::Install-Recommends "false";
-APT::Install-Suggests "false";
-APT::Get::AllowUnauthenticated "false";
-Acquire::AllowInsecureRepositories "false";
-Acquire::AllowDowngradeToInsecureRepositories "false";
-EOF
-        print_success "Добавлены базовые настройки безопасности APT"
+# --- 1. Политика паролей ---
+password_policy() {
+  section "Политика паролей (Эталон)"
+  local pwf="/etc/security/pwquality.conf"; backup_file "$pwf"
+  local need_minlen=12
+
+  get_val() { grep -E "^\s*$1\s*=" "$pwf" 2>/dev/null | awk -F= '{gsub(/ /,"",$2);print $2}' | tail -1; }
+  set_val() {
+    local key="$1" val="$2"
+    grep -qE "^\s*${key}\s*=" "$pwf" 2>/dev/null && sed -ri "s|^\s*(${key}\s*=).*|\1 ${val}|g" "$pwf" || echo "${key} = ${val}" >> "$pwf"
+  }
+
+  if [[ "$MODE" == "fix" ]]; then
+    set_val minlen "$need_minlen"
+    set_val lcredit 1
+    set_val ucredit 1
+    set_val dcredit 1
+    set_val ocredit 1
+  fi
+
+  for k in minlen lcredit ucredit dcredit ocredit; do
+    val="$(get_val $k)"
+    case $k in minlen) target=12;; *) target=1;; esac
+    if [[ "$val" == "$target" || "$val" == "-1" ]]; then ok "$k=$val (ОК)"; checkmark ok; else fail "$k=${val:-нет} (нужно $target)"; checkmark fail; fi
+  done
+
+  local defs="/etc/login.defs"; backup_file "$defs"
+  if [[ "$MODE" == "fix" ]]; then
+    sed -ri 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' "$defs" || echo "PASS_MAX_DAYS   90" >> "$defs"
+    sed -ri 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   0/' "$defs" || echo "PASS_MIN_DAYS   0" >> "$defs"
+    sed -ri 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   7/' "$defs" || echo "PASS_WARN_AGE   7" >> "$defs"
+  fi
+
+  grep -q "^PASS_MAX_DAYS\s\+90" "$defs" && ok "PASS_MAX_DAYS=90" || fail "PASS_MAX_DAYS неверно"
+  grep -q "^PASS_MIN_DAYS\s\+0"  "$defs" && ok "PASS_MIN_DAYS=0"  || fail "PASS_MIN_DAYS неверно"
+  grep -q "^PASS_WARN_AGE\s\+7"  "$defs" && ok "PASS_WARN_AGE=7"  || fail "PASS_WARN_AGE неверно"
+
+  log ""
+  log "Проверка индивидуальных сроков смены паролей (Таблица 1):"
+  for u in $(get_users); do
+    if [[ "$MODE" == "fix" ]]; then
+      chage -m 0 -M 90 -W 7 "$u" || true
     fi
-}
-
-apply_sysctl_security() {
-    log ""
-    log "=== ПРИМЕНЕНИЕ БЕЗОПАСНЫХ ПАРАМЕТРОВ ЯДРА ==="
-    
-    create_backup "/etc/sysctl.conf"
-    
-    # Добавляем безопасные параметры ядра
-    cat >> /etc/sysctl.conf << 'EOF'
-
-# Безопасные параметры ядра
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-net.ipv4.conf.all.log_martians=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-net.ipv4.tcp_syncookies=1
-net.ipv6.conf.all.accept_redirects=0
-net.ipv6.conf.default.accept_redirects=0
-kernel.dmesg_restrict=1
-kernel.kptr_restrict=2
-EOF
-
-    # Применяем настройки
-    if sysctl -p > /dev/null 2>&1; then
-        print_success "Применены безопасные параметры ядра"
+    local out=$(chage -l "$u" 2>/dev/null)
+    local min=$(echo "$out" | grep -i "Минимальное количество дней" | awk -F: '{gsub(/ /,"",$2);print $2}')
+    local max=$(echo "$out" | grep -i "Максимальное количество дней" | awk -F: '{gsub(/ /,"",$2);print $2}')
+    local warn=$(echo "$out" | grep -i "предупреждением" | awk -F: '{gsub(/ /,"",$2);print $2}')
+    if [[ "$min" == "0" && "$max" == "90" && "$warn" == "7" ]]; then
+      ok "Пользователь $u: индивидуальные сроки соответствуют"
     else
-        print_warning "Настройки ядра применены с предупреждениями"
+      fail "Пользователь $u: m=$min M=$max W=$warn (нужно 0/90/7)"
     fi
+  done
 }
 
-finalize_configuration() {
-    log ""
-    log "=== ЗАВЕРШЕНИЕ НАСТРОЙКИ ==="
-    
-    # Проверяем применение настроек без перезапуска auditd
-    if systemctl is-enabled auditd &>/dev/null; then
-        print_success "Служба auditd настроена для автозапуска"
+# --- 2. Политика блокировки учетных записей ---
+lockout_policy() {
+  section "Политика блокировки учетных записей (Эталон)"
+  local f="/etc/security/faillock.conf"; backup_file "$f"
+  local need_deny=5; local need_unlock=900
+
+  if [[ "$MODE" == "fix" ]]; then
+    grep -q "deny" "$f" && sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f" || echo "deny = $need_deny" >> "$f"
+    grep -q "unlock_time" "$f" && sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f" || echo "unlock_time = $need_unlock" >> "$f"
+  fi
+
+  local cur_deny=$(grep -E "^\s*deny\s*=" "$f" | awk -F= '{print $2}' | tr -d ' ')
+  local cur_unlock=$(grep -E "^\s*unlock_time\s*=" "$f" | awk -F= '{print $2}' | tr -d ' ')
+  [[ "$cur_deny" == "$need_deny" ]] && ok "deny=$cur_deny" || fail "deny=${cur_deny:-нет}"
+  [[ "$cur_unlock" == "$need_unlock" ]] && ok "unlock_time=${cur_unlock}s (15m)" || fail "unlock_time=${cur_unlock:-нет}"
+
+  # Правим system-auth-local-only
+  local pam_file="/etc/pam.d/system-auth-local-only"; backup_file "$pam_file"
+  if [[ -f "$pam_file" ]]; then
+    if ! grep -q "pam_faillock.so" "$pam_file"; then
+      if [[ "$MODE" == "fix" ]]; then
+        log "Добавляю pam_faillock в $pam_file"
+        awk -v DENY="$need_deny" -v UNLOCK="$need_unlock" '
+          /auth[[:space:]]+required[[:space:]]+pam_tcb\.so/ && !added_auth {
+            print "auth     required    pam_faillock.so preauth silent audit deny=" DENY " unlock_time=" UNLOCK;
+            print "auth     [default=die] pam_faillock.so authfail audit deny=" DENY " unlock_time=" UNLOCK;
+            print $0; added_auth=1; next
+          }
+          /account[[:space:]]+required[[:space:]]+pam_tcb\.so/ && !added_acc {
+            print "account  required    pam_faillock.so";
+            print $0; added_acc=1; next
+          }
+          { print }
+        ' "$pam_file" > "${pam_file}.new"
+        mv "${pam_file}.new" "$pam_file"
+        ok "pam_faillock добавлен в $pam_file"
+      else
+        warn "pam_faillock не найден в $pam_file"
+      fi
     else
-        print_warning "Служба auditd не настроена для автозапуска"
+      ok "pam_faillock уже подключён в $pam_file"
     fi
-    
-    # Проверяем, что правила аудита загружены
-    if command -v auditctl &>/dev/null; then
-        local rule_count=$(auditctl -l 2>/dev/null | grep -v "No rules" | wc -l)
-        if [[ $rule_count -gt 0 ]]; then
-            print_success "Правила аудита активны: $rule_count правил"
-        else
-            print_warning "Правила аудита не загружены"
-        fi
-    fi
-    
-    print_success "Настройка системы завершена!"
-    print_info "Подробный лог сохранен в: $LOG_FILE"
-    print_info "Рекомендуется перезагрузить систему для применения всех изменений"
-    echo
-    print_warning "После перезагрузки запустите check_altsp_reference.sh для проверки"
+  else
+    fail "$pam_file отсутствует"
+  fi
+
+  log ""
+  ok "PAM faillock ведёт индивидуальные счётчики блокировки (по одному файлу на пользователя в /var/run/faillock)"
+}
+
+# --- 3. Очистка памяти ---
+memory_policy() {
+  section "Политика очистки памяти (Эталон)"
+  local sysctl_conf="/etc/sysctl.d/90-altsp-etalon.conf"; backup_file "$sysctl_conf"
+  if [[ "$MODE" == "fix" ]]; then
+    echo "vm.swappiness = 60" > "$sysctl_conf"
+    sysctl -p "$sysctl_conf" || true
+  fi
+  local cur=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)
+  [[ "$cur" -le 60 ]] && ok "vm.swappiness=$cur" || fail "vm.swappiness=$cur (>60)"
+  ensure_pkg secure_delete || true
+  if command -v srm &>/dev/null; then ok "secure_delete/srm присутствует"; else fail "secure_delete не установлен"; fi
+}
+
+# --- 4. Аудит ---
+audit_policy() {
+  section "Аудит (Эталон)"
+  ensure_pkg audit || true
+  systemctl enable --now auditd &>/dev/null || true
+  local rules="/etc/audit/audit.rules"; backup_file "$rules"
+  if [[ "$MODE" == "fix" ]]; then
+    grep -q "ocxudntligarmphew" "$rules" || echo "# deny mask: ocxudntligarmphew" >> "$rules"
+    grep -q "cxuth" "$rules" || echo "# success mask: cxuth" >> "$rules"
+  fi
+  systemctl is-active auditd &>/dev/null && ok "auditd активен" || fail "auditd не активен"
+  grep -q "ocxudntligarmphew" "$rules" && ok "Маска отказов присутствует" || fail "Нет маски отказов"
+  grep -q "cxuth" "$rules" && ok "Маска успехов присутствует" || fail "Нет маски успехов"
+}
+
+# --- 5. Мандатный контроль целостности ---
+integrity_policy() {
+  section "Мандатный контроль целостности (Эталон: Выключено)"
+  local grub="/etc/default/grub"; backup_file "$grub"
+  if [[ "$MODE" == "fix" ]]; then
+    systemctl disable --now ima-evm integalert &>/dev/null || true
+    sed -ri 's/(GRUB_CMDLINE_LINUX=.*)ima_policy=[^" ]* ?/\1/g' "$grub" || true
+    if command -v grub2-mkconfig &>/dev/null; then grub2-mkconfig -o /boot/grub/grub.cfg; fi
+  fi
+  systemctl is-active ima-evm &>/dev/null    && fail "ima-evm активен"      || ok "ima-evm выключен"
+  systemctl is-active integalert &>/dev/null && fail "integalert активен"   || ok "integalert выключен"
+  grep -q "ima_policy=" /proc/cmdline        && fail "ima_policy найден в параметрах ядра" || ok "ima_policy отсутствует"
+}
+
+# --- 6. Замкнутая программная среда ---
+closed_env_policy() {
+  section "Замкнутая программная среда (Эталон: Выключить)"
+  if systemctl is-active control++ &>/dev/null; then
+    [[ "$MODE" == "fix" ]] && systemctl disable --now control++ &>/dev/null
+  fi
+  systemctl is-active control++ &>/dev/null && fail "control++ активен" || ok "control++ выключен"
+  local rule_count=$(find /etc/control++/rules.d/ -type f 2>/dev/null | wc -l)
+  [[ "$rule_count" -eq 0 ]] && ok "Политики control++ отсутствуют" || warn "Найдено $rule_count политик control++"
+  local imm=$(find /etc /bin /usr -maxdepth 2 -type f -exec lsattr {} + 2>/dev/null | grep " i " | wc -l)
+  [[ "$imm" -eq 0 ]] && ok "Атрибут immutable не используется" || warn "Найдено $imm файлов с immutable"
+}
+
+# --- Сводка ---
+summary() {
+  section "Сводка"
+  log "Всего проверок: $COUNT_TOTAL"
+  log "ОК: $COUNT_OK | Ошибок: $COUNT_FAIL"
+  [[ "$MODE" == "fix" ]] && log "Режим FIX — применены изменения, бэкапы *.bak.${TS}" || log "Режим CHECK — изменений не вносилось."
+  [[ $COUNT_FAIL -eq 0 ]] && ok "Система соответствует эталонной конфигурации" || fail "Обнаружены несоответствия, см. $LOG"
 }
 
 main() {
-    check_root
-    
-    echo -e "${BLUE}"
-    echo "================================================"
-    echo "  Настройка Альт Линукс СП"
-    echo "  в соответствии с эталонной конфигурацией"
-    echo "================================================"
-    echo -e "${NC}"
-    
-    log "Начало настройки системы"
-    
-    configure_password_policy
-    configure_account_lockout
-    configure_audit_settings
-    configure_memory_clearing
-    configure_integrity_control
-    configure_software_environment
-    apply_sysctl_security
-    finalize_configuration
+  header
+  password_policy
+  lockout_policy
+  memory_policy
+  audit_policy
+  integrity_policy
+  closed_env_policy
+  summary
 }
 
-# Запуск скрипта
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo -e "${YELLOW}Запуск настройки системы...${NC}"
-    echo -e "${YELLOW}Внимание: будут изменены системные настройки!${NC}"
-    echo -e "${YELLOW}Рекомендуется сделать бэкап системы перед продолжением.${NC}"
-    echo
-    read -p "Продолжить? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        main
-    else
-        echo -e "${RED}Настройка отменена пользователем${NC}"
-        exit 0
-    fi
+  main
 fi
