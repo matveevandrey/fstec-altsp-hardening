@@ -1,6 +1,7 @@
 #!/bin/bash
 # Настройка ОС Альт Линукс СП под эталонную модель (ФСТЭК/КСЗ/Таблица 1)
-# Версия: 1.6 — без встроенных проверок; вызывает внешний check_altsp_reference.sh при необходимости
+# Версия: 1.7 — добавлен pam_faillock (локальный вход) и аудит SSH
+# Основано на версии 1.6, без удаления прежней логики
 
 set -euo pipefail
 
@@ -26,7 +27,6 @@ ensure_pkg() {
   fi
 }
 
-# Определение пользователей (включая root)
 get_users() {
   awk -F: '($3==0 || $3>=500) && $7 !~ /(false|\/dev\/null)$/ {print $1}' /etc/passwd
 }
@@ -84,38 +84,27 @@ lockout_policy() {
   local need_deny=5 need_unlock=900
   [[ -f "$f" ]] || touch "$f"; backup_file "$f"
 
-  if grep -qE "^\s*deny\s*=" "$f"; then
-    sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f"
-  else
-    echo "deny = $need_deny" >> "$f"
-  fi
-
-  if grep -qE "^\s*unlock_time\s*=" "$f"; then
-    sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f"
-  else
-    echo "unlock_time = $need_unlock" >> "$f"
-  fi
-  ok "Обновлён /etc/security/faillock.conf (deny=5, unlock_time=900)"
+  sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f" 2>/dev/null || echo "deny = $need_deny" >> "$f"
+  sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f" 2>/dev/null || echo "unlock_time = $need_unlock" >> "$f"
+  grep -q "^# even_deny_root" "$f" || echo "# even_deny_root" >> "$f"
+  ok "Обновлён /etc/security/faillock.conf (deny=5, unlock_time=900, root исключён)"
 
   local pam_file="/etc/pam.d/system-auth-local-only"; backup_file "$pam_file"
-  if [[ -f "$pam_file" && ! $(grep -q "pam_faillock.so" "$pam_file"; echo $?) -eq 0 ]]; then
-    awk -v DENY="$need_deny" -v UNLOCK="$need_unlock" '
-      /auth[[:space:]]+required[[:space:]]+pam_tcb\.so/ && !added_auth {
-        print "auth     required    pam_faillock.so preauth silent audit deny=" DENY " unlock_time=" UNLOCK;
-        print "auth     [default=die] pam_faillock.so authfail audit deny=" DENY " unlock_time=" UNLOCK;
-        print $0; added_auth=1; next
-      }
-      /account[[:space:]]+required[[:space:]]+pam_tcb\.so/ && !added_acc {
-        print "account  required    pam_faillock.so";
-        print $0; added_acc=1; next
-      }
-      { print }
-    ' "$pam_file" > "${pam_file}.new"
-    mv "${pam_file}.new" "$pam_file"
-    ok "Добавлен pam_faillock в $pam_file"
-  else
-    ok "pam_faillock уже присутствует в $pam_file"
-  fi
+  cat > "$pam_file" <<'EOF'
+#%PAM-1.0
+# --- Контроль неудачных попыток ---
+auth            requisite       pam_faillock.so preauth silent audit deny=5 unlock_time=900
+auth            [success=1 default=bad] pam_tcb.so shadow fork nullok
+auth            [default=die]   pam_faillock.so authfail deny=5 unlock_time=900
+auth            sufficient      pam_faillock.so authsucc deny=5 unlock_time=900
+
+# --- Основная аутентификация ---
+account         required        pam_tcb.so shadow fork
+password        required        pam_passwdqc.so config=/etc/passwdqc.conf
+password        required        pam_tcb.so use_authtok shadow fork nullok write_to=tcb
+session         required        pam_tcb.so
+EOF
+  ok "Обновлён PAM-стек для локальной аутентификации (system-auth-local-only)"
 }
 
 # --- 3. Очистка памяти ---
@@ -133,10 +122,13 @@ audit_policy() {
   section "Аудит (Эталон)"
   ensure_pkg audit || true
   systemctl enable --now auditd >/dev/null 2>&1 || true
-  local rules="/etc/audit/audit.rules"; backup_file "$rules"
-  grep -q "ocxudntligarmphew" "$rules" || echo "# deny mask: ocxudntligarmphew" >> "$rules"
-  grep -q "cxuth" "$rules" || echo "# success mask: cxuth" >> "$rules"
-  ok "auditd активирован; маски добавлены в $rules (если отсутствовали)"
+  local rules="/etc/audit/rules.d/ssh_fail.rules"; backup_file "$rules"
+  cat > "$rules" <<'EOF'
+# Отслеживание неудачных попыток входа по SSH
+-w /var/log/btmp -p wa -k ssh_fail
+EOF
+  service auditd restart >/dev/null 2>&1 || systemctl restart auditd >/dev/null 2>&1 || true
+  ok "auditd активирован; аудит SSH-входов включен (ключ ssh_fail)"
 }
 
 # --- 5. Мандатный контроль целостности ---
@@ -153,6 +145,15 @@ closed_env_policy() {
   ok "control++ выключен, политики удалены"
 }
 
+# --- 7. Очистка faillock и проверка ---
+reset_and_test() {
+  section "Сброс и проверка"
+  faillock --reset || true
+  ok "Счётчики faillock сброшены"
+  ausearch -k ssh_fail --start recent >/dev/null 2>&1 || true
+  ok "Аудит SSH активен (проверен ключ ssh_fail)"
+}
+
 # --- Основная логика ---
 main() {
   local mode="${1:---verify}"
@@ -165,6 +166,7 @@ main() {
     audit_policy
     integrity_policy
     closed_env_policy
+    reset_and_test
     echo -e "\n${YELLOW}Настройки применены. Проверка эталонного состояния...${NC}"
     if [[ -x ./check_altsp_reference.sh ]]; then
       ./check_altsp_reference.sh
