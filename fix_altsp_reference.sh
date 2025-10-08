@@ -1,9 +1,6 @@
 #!/bin/bash
 # Настройка ОС Альт Линукс СП под эталонную модель (ФСТЭК/КСЗ/Таблица 1)
-# Версия: 1.3 (root включён в проверку и настройку индивидуальных сроков)
-# Режимы:
-#   без флагов / --check : только проверка соответствия
-#   --fix                : применить настройки к эталону
+# Версия: 1.4 — исправлено создание /etc/security/faillock.conf, root включён в проверку, добавлен автозапуск проверки после fix
 
 set -euo pipefail
 
@@ -107,12 +104,23 @@ password_policy() {
 # --- 2. Политика блокировки учетных записей ---
 lockout_policy() {
   section "Политика блокировки учетных записей (Эталон)"
-  local f="/etc/security/faillock.conf"; backup_file "$f"
+  local f="/etc/security/faillock.conf"
   local need_deny=5; local need_unlock=900
+  [[ -f "$f" ]] || touch "$f"
+  backup_file "$f"
 
   if [[ "$MODE" == "fix" ]]; then
-    grep -q "deny" "$f" && sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f" || echo "deny = $need_deny" >> "$f"
-    grep -q "unlock_time" "$f" && sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f" || echo "unlock_time = $need_unlock" >> "$f"
+    if grep -qE "^\s*deny\s*=" "$f"; then
+      sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f"
+    else
+      echo "deny = $need_deny" >> "$f"
+    fi
+
+    if grep -qE "^\s*unlock_time\s*=" "$f"; then
+      sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f"
+    else
+      echo "unlock_time = $need_unlock" >> "$f"
+    fi
   fi
 
   local cur_deny=$(grep -E "^\s*deny\s*=" "$f" | awk -F= '{print $2}' | tr -d ' ')
@@ -228,6 +236,12 @@ main() {
   integrity_policy
   closed_env_policy
   summary
+  # Автоматический запуск проверки после FIX
+  if [[ "$MODE" == "fix" && -x ./check_altsp_reference.sh ]]; then
+    echo -e "\n${YELLOW}Выполняю проверку после применения настроек...${NC}"
+    sleep 2
+    ./check_altsp_reference.sh
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
