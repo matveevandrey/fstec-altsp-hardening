@@ -1,6 +1,6 @@
 #!/bin/bash
 # Скрипт проверки соответствия эталонной конфигурации ОС Альт Линукс СП
-# Версия: 2.5 — единообразный вывод политики паролей, поддержка pam_faillock в system-auth-local-only
+# Версия: 2.6 — поддержка английской и русской локали chage, улучшенный формат отчёта
 
 set -e
 
@@ -47,45 +47,45 @@ check_password_policy() {
   local ocredit=$(grep -E "^\s*ocredit\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
 
   printf "%-70s" "1. Минимальная длина пароля: ${minlen:-нет} (требуется: 12)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$minlen" -eq 12 ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$minlen" -eq 12 ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "2. Минимум строчных символов (lcredit): ${lcredit:-нет} (требуется: -1 или 1)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$lcredit" == "-1" || "$lcredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$lcredit" == "-1" || "$lcredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "3. Минимум заглавных символов (ucredit): ${ucredit:-нет} (требуется: -1 или 1)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$ucredit" == "-1" || "$ucredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$ucredit" == "-1" || "$ucredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "4. Минимум цифр (dcredit): ${dcredit:-нет} (требуется: -1 или 1)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$dcredit" == "-1" || "$dcredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$dcredit" == "-1" || "$dcredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "5. Минимум спецсимволов (ocredit): ${ocredit:-нет} (требуется: -1 или 1)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$ocredit" == "-1" || "$ocredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$ocredit" == "-1" || "$ocredit" == "1" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
-  # Проверка параметров chage (root)
+  # Универсальные регулярки: поддержка ru/en локалей
   local chage_output=$(chage -l root 2>/dev/null)
-  local min_days=$(echo "$chage_output" | grep -i "Минимальное количество дней" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-  local max_days=$(echo "$chage_output" | grep -i "Максимальное количество дней" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-  local warn_days=$(echo "$chage_output" | grep -i "предупреждением" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-  local inactive_days=$(echo "$chage_output" | grep -i "Пароль будет деактивирован" | awk -F: '{print $2}' | tr -d ' ' | head -1)
-  local account_expires=$(echo "$chage_output" | grep -i "Срок действия учётной записи истекает" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+  local min_days=$(echo "$chage_output" | grep -E -i "Минимальное количество дней|Minimum number of days" | awk -F: '{print $2}' | tr -d ' ')
+  local max_days=$(echo "$chage_output" | grep -E -i "Максимальное количество дней|Maximum number of days" | awk -F: '{print $2}' | tr -d ' ')
+  local warn_days=$(echo "$chage_output" | grep -E -i "предупреждением|Number of days of warning" | awk -F: '{print $2}' | tr -d ' ')
+  local inactive_days=$(echo "$chage_output" | grep -E -i "Пароль будет деактивирован|Password inactive" | awk -F: '{print $2}' | tr -d ' ')
+  local account_expires=$(echo "$chage_output" | grep -E -i "Срок действия учётной записи истекает|Account expires" | awk -F: '{print $2}' | tr -d ' ')
 
   printf "%-70s" "6. Минимальное кол-во дней между сменами: ${min_days:-нет} (нужно: 0)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$min_days" -eq 0 ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$min_days" == "0" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "7. Максимальное кол-во дней между сменами: ${max_days:-нет} (нужно: 90)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$max_days" -eq 90 ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$max_days" == "90" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
   printf "%-70s" "8. Предупреждение за: ${warn_days:-нет} (нужно: 7)" | tee -a "$COMPLIANCE_FILE"
-  [[ "$warn_days" -eq 7 ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  [[ "$warn_days" == "7" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
-  printf "%-70s" "9. Неактивность после устаревания: ${inactive_days:-никогда} (нужно: отключено)" | tee -a "$COMPLIANCE_FILE"
-  [[ -z "$inactive_days" || "$inactive_days" == "никогда" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  printf "%-70s" "9. Неактивность после устаревания: ${inactive_days:-never} (нужно: отключено)" | tee -a "$COMPLIANCE_FILE"
+  [[ -z "$inactive_days" || "$inactive_days" == "never" || "$inactive_days" == "никогда" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 
-  printf "%-70s" "10. Срок действия учётной записи: ${account_expires:-никогда} (нужно: отключено)" | tee -a "$COMPLIANCE_FILE"
-  [[ -z "$account_expires" || "$account_expires" == "никогда" ]] && echo -e "${GREEN} ✓${NC}" | tee -a "$COMPLIANCE_FILE" || echo -e "${RED} ✗${NC}" | tee -a "$COMPLIANCE_FILE"
+  printf "%-70s" "10. Срок действия учётной записи: ${account_expires:-never} (нужно: отключено)" | tee -a "$COMPLIANCE_FILE"
+  [[ -z "$account_expires" || "$account_expires" == "never" || "$account_expires" == "никогда" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
 }
 
-# --- Проверка блокировки учётных записей (pam_faillock в system-auth-local-only) ---
+# --- Проверка политики блокировки учетных записей ---
 check_account_lockout() {
   log ""
   log "=== ПРОВЕРКА ПОЛИТИКИ БЛОКИРОВКИ УЧЕТНЫХ ЗАПИСЕЙ ==="
@@ -95,8 +95,10 @@ check_account_lockout() {
     deny=$(grep -E "^deny\s*=" /etc/security/faillock.conf | awk -F= '{print $2}' | tr -d ' ')
     unlock_time=$(grep -E "^unlock_time\s*=" /etc/security/faillock.conf | awk -F= '{print $2}' | tr -d ' ')
   fi
+
   printf "%-70s" "1. Неуспешных попыток (deny): ${deny:-не настроено} (нужно: 5)" | tee -a "$COMPLIANCE_FILE"
   [[ "$deny" == "5" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
+
   local unlock_min=""; [[ -n "$unlock_time" ]] && unlock_min=$((unlock_time/60))
   printf "%-70s" "2. Период блокировки/разблокировки: ${unlock_min:-не настроено} мин (нужно: 15)" | tee -a "$COMPLIANCE_FILE"
   [[ "$unlock_min" == "15" ]] && echo -e "${GREEN} ✓${NC}" || echo -e "${RED} ✗${NC}"
@@ -109,10 +111,11 @@ check_account_lockout() {
       log_color "$RED" "✗ pam_faillock отсутствует в $pam"
     fi
   fi
+
   log_color "$GREEN" "✓ PAM faillock ведёт индивидуальные счётчики блокировки (/var/run/faillock/<user>)"
 }
 
-# --- Остальные проверки (аудит, память, целостность, замкнутая среда) ---
+# --- Проверка аудита ---
 check_audit_settings() {
   log ""
   log "=== ПРОВЕРКА НАСТРОЕК АУДИТА ==="
@@ -121,6 +124,7 @@ check_audit_settings() {
   grep -q "cxuth" /etc/audit/audit.rules && log_color "$GREEN" "✓ Маска успехов присутствует" || log_color "$RED" "✗ Нет маски успехов"
 }
 
+# --- Очистка памяти ---
 check_memory_clearing() {
   log ""
   log "=== ПРОВЕРКА ПОЛИТИКИ ОЧИСТКИ ПАМЯТИ ==="
@@ -130,6 +134,7 @@ check_memory_clearing() {
   if command -v srm &>/dev/null; then log_color "$GREEN" "✓ secure_delete/srm присутствует"; else log_color "$RED" "✗ secure_delete не установлен"; fi
 }
 
+# --- Контроль целостности ---
 check_integrity_control() {
   log ""
   log "=== ПРОВЕРКА МАНДАТНОГО КОНТРОЛЯ ЦЕЛОСТНОСТИ ==="
@@ -138,6 +143,7 @@ check_integrity_control() {
   grep -q "ima_policy=" /proc/cmdline && log_color "$RED" "✗ ima_policy найден" || log_color "$GREEN" "✓ ima_policy отсутствует"
 }
 
+# --- Замкнутая среда ---
 check_software_environment() {
   log ""
   log "=== ПРОВЕРКА ЗАМКНУТОЙ ПРОГРАММНОЙ СРЕДЫ ==="
@@ -146,6 +152,7 @@ check_software_environment() {
   [[ "$rules" -eq 0 ]] && log_color "$GREEN" "✓ Политики control++ отсутствуют" || log_color "$YELLOW" "⚠ Найдено $rules политик control++"
 }
 
+# --- Сводка ---
 generate_summary() {
   log ""
   log "=== СВОДНЫЙ ОТЧЁТ ==="
@@ -158,6 +165,7 @@ generate_summary() {
   [[ $fail -eq 0 ]] && log_color "$GREEN" "✓ Система полностью соответствует эталонной конфигурации" || log_color "$RED" "✗ Обнаружены несоответствия"
 }
 
+# --- Основной блок ---
 main() {
   check_compliance
   check_password_policy
