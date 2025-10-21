@@ -1,7 +1,7 @@
 #!/bin/bash
 # Настройка ОС Альт Линукс СП под эталонную модель (ФСТЭК/КСЗ/Таблица 1)
-# Версия: 1.7 — добавлен pam_faillock (локальный вход) и аудит SSH
-# Основано на версии 1.6, без удаления прежней логики
+# Версия: 2.3 — SSH PermitRootLogin no (автовыбор пути), sysctl-харднинг, расширенный аудит, even_deny_root отключён,
+#          двойной сброс faillock, применение ТОЛЬКО при --fix/--apply (по умолчанию ничего не меняем)
 
 set -euo pipefail
 
@@ -28,14 +28,14 @@ ensure_pkg() {
 }
 
 get_users() {
+  # root и все локальные пользователи uid>=500, у кого не «false»/dev/null в shell
   awk -F: '($3==0 || $3>=500) && $7 !~ /(false|\/dev\/null)$/ {print $1}' /etc/passwd
 }
 
 usage() {
   echo -e "Использование:\n"
-  echo "  $0 --fix        Применить эталонные настройки и при наличии запустить check_altsp_reference.sh"
-  echo "  $0 --verify     Запустить внешний check_altsp_reference.sh для проверки"
-  echo "  $0               То же, что --verify"
+  echo "  $0 --fix        Применить эталонные настройки"
+  echo "  $0 --apply      Синоним --fix"
 }
 
 header_fix() {
@@ -50,9 +50,11 @@ password_policy() {
 
   set_kv() {
     local key="$1" val="$2"
-    grep -qE "^\s*${key}\s*=" "$pwf" 2>/dev/null \
-      && sed -ri "s|^\s*(${key}\s*=).*|\1 ${val}|g" "$pwf" \
-      || echo "${key} = ${val}" >> "$pwf"
+    if grep -qE "^\s*${key}\s*=" "$pwf" 2>/dev/null; then
+      sed -ri "s|^\s*(${key}\s*=).*|\1 ${val}|g" "$pwf"
+    else
+      echo "${key} = ${val}" >> "$pwf"
+    fi
   }
 
   set_kv minlen 12
@@ -60,7 +62,7 @@ password_policy() {
   set_kv ucredit 1
   set_kv dcredit 1
   set_kv ocredit 1
-  ok "Обновлён /etc/security/pwquality.conf (minlen=12, l/u/d/o credit=1)"
+  ok "Обновлён /etc/security/pwquality.conf (minlen=12, l/u/d/o=1)"
 
   local defs="/etc/login.defs"; backup_file "$defs"
   sed -ri 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' "$defs" || true
@@ -84,19 +86,32 @@ lockout_policy() {
   local need_deny=5 need_unlock=900
   [[ -f "$f" ]] || touch "$f"; backup_file "$f"
 
-  sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f" 2>/dev/null || echo "deny = $need_deny" >> "$f"
-  sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f" 2>/dev/null || echo "unlock_time = $need_unlock" >> "$f"
-  grep -q "^# even_deny_root" "$f" || echo "# even_deny_root" >> "$f"
-  ok "Обновлён /etc/security/faillock.conf (deny=5, unlock_time=900, root исключён)"
+  # Настройка faillock.conf
+  if grep -qE "^\s*deny\s*=" "$f"; then
+    sed -ri "s|^\s*deny\s*=.*|deny = $need_deny|" "$f"
+  else
+    echo "deny = $need_deny" >> "$f"
+  fi
+  if grep -qE "^\s*unlock_time\s*=" "$f"; then
+    sed -ri "s|^\s*unlock_time\s*=.*|unlock_time = $need_unlock|" "$f"
+  else
+    echo "unlock_time = $need_unlock" >> "$f"
+  fi
+  # Root НЕ блокируем — even_deny_root оставляем отключённым (закомментировано как подсказка)
+  if ! grep -qE '^\s*#\s*even_deny_root' "$f"; then
+    echo "# even_deny_root" >> "$f"
+  fi
+  ok "Обновлён /etc/security/faillock.conf (deny=5, unlock_time=900; root исключён — even_deny_root отключён)"
 
+  # PAM: стек локальной аутентификации (без even_deny_root)
   local pam_file="/etc/pam.d/system-auth-local-only"; backup_file "$pam_file"
   cat > "$pam_file" <<'EOF'
 #%PAM-1.0
-# --- Контроль неудачных попыток ---
+# --- Контроль неудачных попыток (root НЕ блокируем; even_deny_root не используем) ---
 auth            requisite       pam_faillock.so preauth silent audit deny=5 unlock_time=900
 auth            [success=1 default=bad] pam_tcb.so shadow fork nullok
-auth            [default=die]   pam_faillock.so authfail deny=5 unlock_time=900
-auth            sufficient      pam_faillock.so authsucc deny=5 unlock_time=900
+auth            [default=die]   pam_faillock.so authfail audit deny=5 unlock_time=900
+auth            sufficient      pam_faillock.so authsucc audit deny=5 unlock_time=900
 
 # --- Основная аутентификация ---
 account         required        pam_tcb.so shadow fork
@@ -104,31 +119,172 @@ password        required        pam_passwdqc.so config=/etc/passwdqc.conf
 password        required        pam_tcb.so use_authtok shadow fork nullok write_to=tcb
 session         required        pam_tcb.so
 EOF
-  ok "Обновлён PAM-стек для локальной аутентификации (system-auth-local-only)"
+  ok "Обновлён PAM-стек (system-auth-local-only); even_deny_root не применяется"
+
+  # Сброс накопленных блокировок — оба способа, как согласовано
+  rm -f /var/run/faillock/* 2>/dev/null || true
+  faillock --reset 2>/dev/null || true
+  ok "Счётчики faillock сброшены (rm и faillock --reset)"
 }
 
-# --- 3. Очистка памяти ---
-memory_policy() {
-  section "Политика очистки памяти (Эталон)"
+# --- 3. Системные параметры и гарантированное удаление ---
+system_hardening() {
+  section "Системные параметры безопасности и гарантированное удаление"
   local sysctl_conf="/etc/sysctl.d/90-altsp-etalon.conf"; backup_file "$sysctl_conf"
-  echo "vm.swappiness = 60" > "$sysctl_conf"
+
+  cat > "$sysctl_conf" <<'EOF'
+# Эталонная системная конфигурация безопасности ALT СП
+vm.swappiness = 10
+user.max_user_namespaces = 0
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+EOF
+
   sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+  ok "Применены параметры: swappiness=10, max_user_namespaces=0, dmesg_restrict=1, kptr_restrict=2"
+
   ensure_pkg secure_delete || true
-  ok "Настроено: vm.swappiness=60; пакет secure_delete установлен (если был недоставлен)"
+  ok "Пакет secure_delete установлен (srm/sfill/sswap/smem доступны)"
 }
 
-# --- 4. Аудит ---
+# --- 4. Аудит: расширенный набор ---
 audit_policy() {
-  section "Аудит (Эталон)"
+  section "Аудит (расширенный профиль)"
   ensure_pkg audit || true
   systemctl enable --now auditd >/dev/null 2>&1 || true
-  local rules="/etc/audit/rules.d/ssh_fail.rules"; backup_file "$rules"
-  cat > "$rules" <<'EOF'
-# Отслеживание неудачных попыток входа по SSH
--w /var/log/btmp -p wa -k ssh_fail
+
+  # Конфигурация auditd
+  local AUDITD_CONF="/etc/audit/auditd.conf"; backup_file "$AUDITD_CONF"
+  cat > "$AUDITD_CONF" <<'EOF'
+log_file = /var/log/audit/audit.log
+log_format = RAW
+flush = INCREMENTAL_ASYNC
+freq = 50
+max_log_file = 80
+num_logs = 10
+max_log_file_action = ROTATE
+space_left = 75
+space_left_action = SYSLOG
+admin_space_left = 50
+admin_space_left_action = SUSPEND
+disk_full_action = SUSPEND
+disk_error_action = SUSPEND
 EOF
+
+  # Основные правила в rules.d
+  local RULES_FILE="/etc/audit/rules.d/security-audit.rules"; backup_file "$RULES_FILE"
+  cat > "$RULES_FILE" <<'EOF'
+# =========== Идентификация и база учетных записей ===========
+-w /etc/passwd  -p wa -k identity_database
+-w /etc/group   -p wa -k identity_database
+-w /etc/gshadow -p wa -k identity_database
+-w /etc/shadow  -p wa -k identity_database
+
+# =========== Конфигурация SSH ===========
+# Вариант с классическим путём
+-w /etc/ssh/sshd_config    -p wa -k ssh_config
+-w /etc/ssh/ssh_config     -p wa -k ssh_config
+-w /etc/ssh/sshd_config.d  -p wa -k ssh_config
+# Вариант с /etc/openssh/ (как на части систем ALT)
+-w /etc/openssh/sshd_config    -p wa -k ssh_config
+-w /etc/openssh/ssh_config     -p wa -k ssh_config
+-w /etc/openssh/sshd_config.d  -p wa -k ssh_config
+
+# =========== Попытки аутентификации и неудачные входы ===========
+-w /var/log/btmp  -p wa -k login_fail
+-w /var/log/wtmp  -p wa -k login_success
+-w /var/log/secure -p wa -k security_logs
+
+# =========== Запуск процессов ===========
+-a always,exit -F arch=b64 -S execve -k process_execution
+-a always,exit -F arch=b32 -S execve -k process_execution
+
+# =========== Изменения прав и владельцев ===========
+-a always,exit -F arch=b64 -S chmod,chown,lchown,fchmod,fchown -k file_access
+-a always,exit -F arch=b32 -S chmod,chown,lchown,fchmod,fchown -k file_access
+
+# =========== SUDO / Привилегированные действия ===========
+-w /etc/sudoers   -p wa -k privilege_escalation
+-w /etc/sudoers.d -p wa -k privilege_escalation
+
+# =========== Конфигурация ядра и сети ===========
+-w /etc/sysctl.conf -p wa -k kernel_config
+-w /etc/sysctl.d    -p wa -k kernel_config
+-w /etc/hosts       -p wa -k network_config
+-w /etc/resolv.conf -p wa -k network_config
+
+# =========== Планировщик задач ===========
+-w /etc/cron.allow   -p wa -k cron_config
+-w /etc/cron.deny    -p wa -k cron_config
+-w /etc/crontab      -p wa -k cron_config
+-w /etc/cron.d       -p wa -k cron_config
+-w /etc/cron.daily   -p wa -k cron_config
+-w /etc/cron.hourly  -p wa -k cron_config
+-w /etc/cron.monthly -p wa -k cron_config
+-w /etc/cron.weekly  -p wa -k cron_config
+-w /var/spool/cron   -p wa -k cron_spool
+
+# =========== Файлы аудита ===========
+-w /var/log/audit/ -p wa -k audit_config
+-w /etc/audit/     -p wa -k audit_config
+
+# =========== Резерв: директории конфигураций ===========
+-w /etc/ -p wa -k etc_changes
+EOF
+
+  # Утилиты для админа
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-status <<'EOF'
+#!/bin/sh
+echo "== auditctl -s =="; auditctl -s
+echo
+echo "== auditctl -l (top 50) =="; auditctl -l | sed -n '1,50p'
+EOF
+
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-search <<'EOF'
+#!/bin/sh
+if [ -z "$1" ]; then
+  echo "Usage: audit-search <key>"; exit 1
+fi
+ausearch -k "$1" | aureport -f -i
+EOF
+
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-report <<'EOF'
+#!/bin/sh
+echo "== Summary =="; aureport --summary --failed --success -i
+echo; echo "== Auth =="; aureport --auth -i
+echo; echo "== Files =="; aureport --files -i
+EOF
+
+  # Logrotate для /var/log/audit
+  local LR="/etc/logrotate.d/audit"; backup_file "$LR"
+  cat > "$LR" <<'EOF'
+/var/log/audit/*.log {
+    rotate 10
+    weekly
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /sbin/service auditd reload > /dev/null 2>/dev/null || true
+    endscript
+}
+EOF
+
+  # Ежедневный отчёт
+  local CRONR="/etc/cron.daily/audit-daily-report"; backup_file "$CRONR"
+  cat > "$CRONR" <<'EOF'
+#!/bin/sh
+test -x /usr/local/sbin/audit-report || exit 0
+/usr/local/sbin/audit-report | logger -t audit-daily-report
+EOF
+  chmod 0755 "$CRONR"
+
+  # Подгрузка правил
   service auditd restart >/dev/null 2>&1 || systemctl restart auditd >/dev/null 2>&1 || true
-  ok "auditd активирован; аудит SSH-входов включен (ключ ssh_fail)"
+  auditctl -R "$RULES_FILE" >/dev/null 2>&1 || true
+  ok "Расширенная политика аудита применена (security-audit.rules), auditd активирован"
 }
 
 # --- 5. Мандатный контроль целостности ---
@@ -138,53 +294,59 @@ integrity_policy() {
   ok "ima-evm и integalert отключены"
 }
 
-# --- 6. Замкнутая среда ---
+# --- 6. Замкнутая программная среда ---
 closed_env_policy() {
   section "Замкнутая программная среда (Эталон)"
   systemctl disable --now control++ &>/dev/null || true
-  ok "control++ выключен, политики удалены"
+  ok "control++ выключен, политики удалены (если были)"
 }
 
-# --- 7. Очистка faillock и проверка ---
-reset_and_test() {
-  section "Сброс и проверка"
-  faillock --reset || true
-  ok "Счётчики faillock сброшены"
-  ausearch -k ssh_fail --start recent >/dev/null 2>&1 || true
-  ok "Аудит SSH активен (проверен ключ ssh_fail)"
+# --- 7. SSH: запрет входа root ---
+sshd_hardening() {
+  section "Настройка SSH (Эталон)"
+  local sshd_conf=""
+  if   [[ -f /etc/openssh/sshd_config ]]; then
+    sshd_conf="/etc/openssh/sshd_config"
+  elif [[ -f /etc/ssh/sshd_config ]]; then
+    sshd_conf="/etc/ssh/sshd_config"
+  else
+    sshd_conf="/etc/openssh/sshd_config"
+    mkdir -p /etc/openssh
+    touch "$sshd_conf"
+  fi
+
+  backup_file "$sshd_conf"
+  if grep -qE '^\s*PermitRootLogin\s+' "$sshd_conf" 2>/dev/null; then
+    sed -ri 's/^\s*PermitRootLogin\s+.*/PermitRootLogin no/' "$sshd_conf"
+  else
+    echo "PermitRootLogin no" >> "$sshd_conf"
+  fi
+
+  systemctl restart sshd >/dev/null 2>&1 || true
+  ok "Обновлён ${sshd_conf} — вход root по SSH запрещён (PermitRootLogin no)"
 }
 
 # --- Основная логика ---
 main() {
-  local mode="${1:---verify}"
+  local mode="${1:-}"
 
-  if [[ "$mode" == "--fix" ]]; then
-    header_fix
-    password_policy
-    lockout_policy
-    memory_policy
-    audit_policy
-    integrity_policy
-    closed_env_policy
-    reset_and_test
-    echo -e "\n${YELLOW}Настройки применены. Проверка эталонного состояния...${NC}"
-    if [[ -x ./check_altsp_reference.sh ]]; then
-      ./check_altsp_reference.sh
-    else
-      echo -e "${YELLOW}⚠ Скрипт check_altsp_reference.sh не найден или не исполняемый.${NC}"
-      echo -e "   Для проверки выполните вручную: ${BLUE}bash check_altsp_reference.sh${NC}"
-    fi
-  elif [[ "$mode" == "--verify" || "$mode" == "" ]]; then
-    if [[ -x ./check_altsp_reference.sh ]]; then
-      ./check_altsp_reference.sh
-    else
-      echo -e "${YELLOW}⚠ Скрипт check_altsp_reference.sh не найден или не исполняемый.${NC}"
-      echo -e "   Для запуска проверки скачайте его из репозитория или скопируйте рядом с этим скриптом."
+  case "$mode" in
+    --fix|--apply)
+      header_fix
+      password_policy
+      lockout_policy
+      system_hardening
+      audit_policy
+      integrity_policy
+      closed_env_policy
+      sshd_hardening
+      echo -e "\n${GREEN}Готово: эталонные настройки применены. Лог: ${LOG}${NC}"
+      ;;
+    *)
+      usage
       exit 1
-    fi
-  else
-    usage
-  fi
+      ;;
+  esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
