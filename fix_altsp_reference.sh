@@ -1,7 +1,8 @@
 #!/bin/bash
 # Настройка ОС Альт Линукс СП под эталонную модель (ФСТЭК/КСЗ/Таблица 1)
-# Версия: 2.3 — SSH PermitRootLogin no (автовыбор пути), sysctl-харднинг, расширенный аудит, even_deny_root отключён,
-#          двойной сброс faillock, применение ТОЛЬКО при --fix/--apply (по умолчанию ничего не меняем)
+# Версия: 2.5 — apply-only (только по --fix/--apply), SSH PermitRootLogin no (автовыбор пути),
+# sysctl-харднинг, расширенный аудит (условные SSH-пути, syscall escalation), passwdqc.conf
+# even_deny_root отключён, двойной сброс faillock, предупреждения о дублях правил аудита.
 
 set -euo pipefail
 
@@ -43,9 +44,28 @@ header_fix() {
   echo "Дата: $(date) | Хост: $(hostname) | Релиз: $(head -1 /etc/altlinux-release 2>/dev/null || echo ALT SP)" | tee -a "$LOG"
 }
 
-# --- 1. Политика паролей ---
+# --- 0. PASSWDQC: строгая политика паролей (под форматы check.sh) ---
+passwdqc_policy() {
+  section "PASSWDQC (строгая политика)"
+  local f="/etc/passwdqc.conf"
+  backup_file "$f"
+  cat > "$f" <<'EOF'
+# Password quality configuration
+# Minimal password lengths for different password types
+min=disabled,disabled,12,12,12
+max=40
+passphrase=3
+match=4
+similar=permit
+enforce=everyone
+retry=5
+EOF
+  ok "Создан /etc/passwdqc.conf по эталонной модели (min=disabled,disabled,12,12,12)"
+}
+
+# --- 1. Политика паролей (pwquality + login.defs + chage) ---
 password_policy() {
-  section "Политика паролей (Эталон)"
+  section "Политика паролей (pwquality, login.defs, chage)"
   local pwf="/etc/security/pwquality.conf"; backup_file "$pwf"
 
   set_kv() {
@@ -81,7 +101,7 @@ password_policy() {
 
 # --- 2. Политика блокировки учетных записей ---
 lockout_policy() {
-  section "Политика блокировки учетных записей (Эталон)"
+  section "Политика блокировки учетных записей (faillock)"
   local f="/etc/security/faillock.conf"
   local need_deny=5 need_unlock=900
   [[ -f "$f" ]] || touch "$f"; backup_file "$f"
@@ -127,7 +147,7 @@ EOF
   ok "Счётчики faillock сброшены (rm и faillock --reset)"
 }
 
-# --- 3. Системные параметры и гарантированное удаление ---
+# --- 3. Системные параметры безопасности и гарантированное удаление ---
 system_hardening() {
   section "Системные параметры безопасности и гарантированное удаление"
   local sysctl_conf="/etc/sysctl.d/90-altsp-etalon.conf"; backup_file "$sysctl_conf"
@@ -147,7 +167,7 @@ EOF
   ok "Пакет secure_delete установлен (srm/sfill/sswap/smem доступны)"
 }
 
-# --- 4. Аудит: расширенный набор ---
+# --- 4. Аудит: расширенный профиль (условные SSH-пути, syscall escalation) ---
 audit_policy() {
   section "Аудит (расширенный профиль)"
   ensure_pkg audit || true
@@ -171,9 +191,21 @@ disk_full_action = SUSPEND
 disk_error_action = SUSPEND
 EOF
 
-  # Основные правила в rules.d
-  local RULES_FILE="/etc/audit/rules.d/security-audit.rules"; backup_file "$RULES_FILE"
-  cat > "$RULES_FILE" <<'EOF'
+  # Основные правила — пишем в единый файл
+  local RULES_DIR="/etc/audit/rules.d"
+  local RULES_FILE="${RULES_DIR}/security-audit.rules"
+  backup_file "$RULES_FILE"
+
+  # Соберём SSH-пути, которые реально существуют (чтобы не ломать augenrules на "No such file")
+  local ssh_paths=()
+  for p in \
+    /etc/ssh/sshd_config /etc/ssh/ssh_config /etc/ssh/sshd_config.d \
+    /etc/openssh/sshd_config /etc/openssh/ssh_config /etc/openssh/sshd_config.d
+  do
+    [[ -e "$p" ]] && ssh_paths+=("$p")
+  done
+
+  cat > "$RULES_FILE" <<EOF
 # =========== Идентификация и база учетных записей ===========
 -w /etc/passwd  -p wa -k identity_database
 -w /etc/group   -p wa -k identity_database
@@ -181,18 +213,21 @@ EOF
 -w /etc/shadow  -p wa -k identity_database
 
 # =========== Конфигурация SSH ===========
-# Вариант с классическим путём
--w /etc/ssh/sshd_config    -p wa -k ssh_config
--w /etc/ssh/ssh_config     -p wa -k ssh_config
--w /etc/ssh/sshd_config.d  -p wa -k ssh_config
-# Вариант с /etc/openssh/ (как на части систем ALT)
--w /etc/openssh/sshd_config    -p wa -k ssh_config
--w /etc/openssh/ssh_config     -p wa -k ssh_config
--w /etc/openssh/sshd_config.d  -p wa -k ssh_config
+EOF
+
+  if ((${#ssh_paths[@]})); then
+    for p in "${ssh_paths[@]}"; do
+      echo "-w $p -p wa -k ssh_config" >> "$RULES_FILE"
+    done
+  else
+    echo "# (SSH-конфиги на диске не обнаружены; секция пропущена)" >> "$RULES_FILE"
+  fi
+
+  cat >> "$RULES_FILE" <<'EOF'
 
 # =========== Попытки аутентификации и неудачные входы ===========
--w /var/log/btmp  -p wa -k login_fail
--w /var/log/wtmp  -p wa -k login_success
+-w /var/log/btmp   -p wa -k login_fail
+-w /var/log/wtmp   -p wa -k login_success
 -w /var/log/secure -p wa -k security_logs
 
 # =========== Запуск процессов ===========
@@ -203,7 +238,11 @@ EOF
 -a always,exit -F arch=b64 -S chmod,chown,lchown,fchmod,fchown -k file_access
 -a always,exit -F arch=b32 -S chmod,chown,lchown,fchmod,fchown -k file_access
 
-# =========== SUDO / Привилегированные действия ===========
+# =========== Повышение привилегий (syscall) ===========
+-a always,exit -F arch=b64 -S setuid -S setgid -S setreuid -S setregid -S setresuid -S setresgid -k privilege_escalation
+-a always,exit -F arch=b32 -S setuid -S setgid -S setreuid -S setregid -S setresuid -S setresgid -k privilege_escalation
+
+# =========== SUDO / Конфигурационные файлы привилегий ===========
 -w /etc/sudoers   -p wa -k privilege_escalation
 -w /etc/sudoers.d -p wa -k privilege_escalation
 
@@ -232,28 +271,18 @@ EOF
 -w /etc/ -p wa -k etc_changes
 EOF
 
-  # Утилиты для админа
-  install -m 0755 /dev/stdin /usr/local/sbin/audit-status <<'EOF'
-#!/bin/sh
-echo "== auditctl -s =="; auditctl -s
-echo
-echo "== auditctl -l (top 50) =="; auditctl -l | sed -n '1,50p'
-EOF
-
-  install -m 0755 /dev/stdin /usr/local/sbin/audit-search <<'EOF'
-#!/bin/sh
-if [ -z "$1" ]; then
-  echo "Usage: audit-search <key>"; exit 1
-fi
-ausearch -k "$1" | aureport -f -i
-EOF
-
-  install -m 0755 /dev/stdin /usr/local/sbin/audit-report <<'EOF'
-#!/bin/sh
-echo "== Summary =="; aureport --summary --failed --success -i
-echo; echo "== Auth =="; aureport --auth -i
-echo; echo "== Files =="; aureport --files -i
-EOF
+  # Предупреждение о возможных дублях ключей в других .rules
+  if ls -1 "$RULES_DIR"/*.rules &>/dev/null; then
+    mapfile -t keys < <(grep -Eo -- ' -k[[:space:]]+[[:alnum:]_]+' "$RULES_FILE" | awk '{print $2}' | sort -u)
+    for f in "$RULES_DIR"/*.rules; do
+      [[ "$f" == "$RULES_FILE" ]] && continue
+      for k in "${keys[@]}"; do
+        if grep -qE " -k[[:space:]]+$k([[:space:]]|$)" "$f"; then
+          warn "Возможный дубликат ключа '$k' в файле: $f (проверьте и удалите дубли во избежание Rule exists)"
+        fi
+      done
+    done
+  fi
 
   # Logrotate для /var/log/audit
   local LR="/etc/logrotate.d/audit"; backup_file "$LR"
@@ -272,6 +301,29 @@ EOF
 }
 EOF
 
+  # Утилиты для админа
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-status <<'EOF'
+#!/bin/sh
+echo "== auditctl -s =="; auditctl -s
+echo
+echo "== auditctl -l (top 100) =="; auditctl -l | sed -n '1,100p'
+EOF
+
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-search <<'EOF'
+#!/bin/sh
+if [ -z "$1" ]; then
+  echo "Usage: audit-search <key>"; exit 1
+fi
+ausearch -k "$1" | aureport -f -i
+EOF
+
+  install -m 0755 /dev/stdin /usr/local/sbin/audit-report <<'EOF'
+#!/bin/sh
+echo "== Summary =="; aureport --summary --failed --success -i
+echo; echo "== Auth =="; aureport --auth -i
+echo; echo "== Files =="; aureport --files -i
+EOF
+
   # Ежедневный отчёт
   local CRONR="/etc/cron.daily/audit-daily-report"; backup_file "$CRONR"
   cat > "$CRONR" <<'EOF'
@@ -281,29 +333,31 @@ test -x /usr/local/sbin/audit-report || exit 0
 EOF
   chmod 0755 "$CRONR"
 
-  # Подгрузка правил
+  # Загрузка правил через augenrules + рестарт auditd
+  augenrules --check >/dev/null 2>&1 || true
+  augenrules --load  >/dev/null 2>&1 || true
   service auditd restart >/dev/null 2>&1 || systemctl restart auditd >/dev/null 2>&1 || true
-  auditctl -R "$RULES_FILE" >/dev/null 2>&1 || true
-  ok "Расширенная политика аудита применена (security-audit.rules), auditd активирован"
+
+  ok "Применена расширенная политика аудита (security-audit.rules), auditd активирован"
 }
 
 # --- 5. Мандатный контроль целостности ---
 integrity_policy() {
-  section "Мандатный контроль целостности (Эталон)"
+  section "Мандатный контроль целостности"
   systemctl disable --now ima-evm integalert &>/dev/null || true
   ok "ima-evm и integalert отключены"
 }
 
 # --- 6. Замкнутая программная среда ---
 closed_env_policy() {
-  section "Замкнутая программная среда (Эталон)"
+  section "Замкнутая программная среда"
   systemctl disable --now control++ &>/dev/null || true
   ok "control++ выключен, политики удалены (если были)"
 }
 
 # --- 7. SSH: запрет входа root ---
 sshd_hardening() {
-  section "Настройка SSH (Эталон)"
+  section "Настройка SSH (PermitRootLogin no)"
   local sshd_conf=""
   if   [[ -f /etc/openssh/sshd_config ]]; then
     sshd_conf="/etc/openssh/sshd_config"
@@ -333,6 +387,7 @@ main() {
   case "$mode" in
     --fix|--apply)
       header_fix
+      passwdqc_policy
       password_policy
       lockout_policy
       system_hardening
